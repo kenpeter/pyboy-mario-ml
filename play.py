@@ -121,6 +121,8 @@ class MarioEnv(gym.Env):
         self.pyboy.stop(save=False)
         # Reinitialize PyBoy with the ROM, setting rendering based on self.render
         self.pyboy = PyBoy(self.rom_path, window="SDL2" if self.render else "null")
+        # Advance the emulator one frame to initialize the screen buffer
+        self.pyboy.tick()
         # Set initial previous coin count for reward calculation
         self.prev_coins = get_coins(self.pyboy)
         # Set initial previous X position for reward calculation
@@ -185,8 +187,8 @@ class MarioEnv(gym.Env):
 
     # Get the current screen as an RGB array
     def _get_observation(self):
-        # Retrieve the screen data from PyBoy’s screen manager as a NumPy array
-        return self.pyboy.botsupport_manager().screen().screen_ndarray()
+        # Retrieve the screen data directly from PyBoy’s screen property as a NumPy array
+        return self.pyboy.screen.screen_ndarray()
 
     # Calculate the reward based on game state changes
     def _get_reward(self):
@@ -218,7 +220,7 @@ class MarioEnv(gym.Env):
     def render(self, mode='human'):
         # If rendering is enabled and mode is human, display the screen
         if self.render and mode == 'human':
-            self.pyboy.botsupport_manager().screen().screen_ndarray()
+            self.pyboy.screen.screen_ndarray()
         # If mode is rgb_array, return the screen array without displaying
         elif mode == 'rgb_array':
             return self._get_observation()
@@ -311,8 +313,8 @@ def train_rl_agent():
         # Render the screen to visualize Mario’s actions
         env.render()
         # Optional: Print position and reward for each test step (commented out to reduce clutter)
-        mario_x, mario_y = get_mario_position(env.pyboy)
-        print(f"Test - Mario Position: ({mario_x}, {mario_y}), Reward: {rewards}")
+        # mario_x, mario_y = get_mario_position(env.pyboy)
+        # print(f"Test - Mario Position: ({mario_x}, {mario_y}), Reward: {rewards}")
         # Reset if episode ends (Mario dies)
         if done:
             obs = env.reset()
