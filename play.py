@@ -144,7 +144,8 @@ def train_rl_agent():
     env = MarioEnv('SuperMarioLand.gb', render=False)
     model = PPO("CnnPolicy", env, verbose=1)
     model.learn(total_timesteps=100000)
-    model.save("mario_ppo_model")
+    model.save(r"C:\Users\figo2\work\pyboy\mario_ppo_model")
+    print("Model saved as mario_ppo_model.zip")
 
     # Test with rendering
     env = MarioEnv('SuperMarioLand.gb', render=True)
