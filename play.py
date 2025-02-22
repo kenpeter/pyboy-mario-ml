@@ -238,16 +238,29 @@ def main():
     frame_time = 1 / target_fps
     # Record the start time for timing control
     last_time = time.time()
+    # Track previous lives to detect changes
+    prev_lives = get_lives(pyboy)
 
     # Run the emulator loop with error handling
     try:
-        # Continue looping until the emulator stops (e.g., window closed)
+        # Continue looping until emulator stops or game over
         while True:
-            # Advance one frame; break if tick returns False (emulator stopped)
+            # Advance one frame; break if tick returns False (e.g., window closed)
             if not pyboy.tick():
                 break
             # Run the simple AI logic for this frame
             simple_ai(pyboy)
+            # Get current lives to check for game over
+            current_lives = get_lives(pyboy)
+            # Check if lives decreased (Mario died)
+            if current_lives < prev_lives:
+                print(f"Mario died! Lives decreased from {prev_lives} to {current_lives}")
+            # Update previous lives for next iteration
+            prev_lives = current_lives
+            # Break the loop if lives reach 0 (game over)
+            if current_lives == 0:
+                print("Game Over! Lives reached 0.")
+                break
             # Get the current time for timing adjustment
             current_time = time.time()
             # Calculate elapsed time since last frame
@@ -294,11 +307,10 @@ def train_rl_agent():
         # Predict the next action based on the current observation
         action, _states = model.predict(obs)
         # Execute the action and get new state, reward, and done flag
-        # the step is inside training
         obs, rewards, done, info = env.step(action)
         # Render the screen to visualize Mario’s actions
         env.render()
-        # Optional: Print position and reward for each test step (remove if too verbose)
+        # Optional: Print position and reward for each test step (commented out to reduce clutter)
         mario_x, mario_y = get_mario_position(env.pyboy)
         print(f"Test - Mario Position: ({mario_x}, {mario_y}), Reward: {rewards}")
         # Reset if episode ends (Mario dies)
