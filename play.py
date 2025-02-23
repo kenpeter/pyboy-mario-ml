@@ -114,12 +114,12 @@ class MarioEnv(gym.Env):
         mario_x, mario_y = get_mario_position(self.pyboy)
         current_coins = get_coins(self.pyboy)
         current_lives = get_lives(self.pyboy)
-        progress_reward = (mario_x - self.prev_x) * 0.5
-        coin_reward = (current_coins - self.prev_coins) * 20
-        survival_reward = 1
+        progress_reward = (mario_x - self.prev_x) * 1  # Increased from 0.5
+        coin_reward = (current_coins - self.prev_coins) * 50  # Increased from 20
+        survival_reward = 2  # Increased from 1
         death_penalty = -10 if current_lives < self.prev_lives else 0
         jump_reward = 5 if mario_y < 80 else 0
-        stall_penalty = -2 if mario_x == self.prev_x and mario_y >= 100 else 0
+        stall_penalty = -1 if mario_x == self.prev_x and mario_y >= 100 else 0  # Reduced from -2
         return progress_reward + coin_reward + survival_reward + death_penalty + jump_reward + stall_penalty
 
     def _is_done(self):
@@ -173,7 +173,7 @@ def main():
         pyboy.stop()
 
 def train_rl_agent(headless=True):
-    env = MarioEnv('SuperMarioLand.gb', render=not headless)  # headless=True means no UI, False means UI
+    env = MarioEnv('SuperMarioLand.gb', render=not headless)
     model = PPO(
         "CnnPolicy",
         env,
@@ -187,11 +187,11 @@ def train_rl_agent(headless=True):
         clip_range=0.2,
         ent_coef=0.01
     )
-    model.learn(total_timesteps=1000)
+    model.learn(total_timesteps=50000)  # Increased from 1000
     model.save("mario_ppo_model")
     print("=== Training Complete. Saved 'mario_ppo_model.zip' ===")
 
-    env = MarioEnv('SuperMarioLand.gb', render=True)  # Testing always with UI
+    env = MarioEnv('SuperMarioLand.gb', render=True)
     obs = env.reset()
     total_reward = 0
     for _ in range(2000):
@@ -207,5 +207,4 @@ def train_rl_agent(headless=True):
 
 if __name__ == "__main__":
     main()
-    # Switch between headless (True) and UI (False) mode here
-    train_rl_agent(headless=True)  # Default to headless mode
+    train_rl_agent(headless=True)
