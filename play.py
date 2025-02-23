@@ -43,7 +43,7 @@ class MarioEnv(gym.Env):
         super(MarioEnv, self).__init__()
         self.rom_path = rom_path
         self.render_enabled = render
-        self.pyboy = PyBoy(rom_path, window="SDL2")
+        self.pyboy = PyBoy(rom_path, window="SDL2" if render else "null")
         self.action_space = gym.spaces.Discrete(4)
         self.observation_space = gym.spaces.Box(low=0, high=255, shape=(144, 160, 3), dtype=np.uint8)
         press_start(self.pyboy)
@@ -60,7 +60,7 @@ class MarioEnv(gym.Env):
 
     def reset(self):
         self.pyboy.stop(save=False)
-        self.pyboy = PyBoy(self.rom_path, window="SDL2")
+        self.pyboy = PyBoy(self.rom_path, window="SDL2" if self.render_enabled else "null")
         press_start(self.pyboy)
         for i in range(600):
             self.pyboy.tick()
@@ -160,21 +160,20 @@ def main():
                 stop_jumping(pyboy)
             current_lives = get_lives(pyboy)
             if current_lives < prev_lives:
-                pass  # Removed debug: "Mario died! Lives: {current_lives}"
+                pass  # Removed debug
             prev_lives = current_lives
             if current_lives == 0:
-                break  # Removed debug: "Game Over!"
+                break  # Removed debug
             current_time = time.time()
             elapsed = current_time - last_time
             if elapsed < frame_time:
                 time.sleep(frame_time - elapsed)
             last_time = time.time()
-            # Removed debug: print(f"Mario Position: ({mario_x}, {mario_y}), Lives: {lives}, Coins: {coins}")
     finally:
         pyboy.stop()
 
-def train_rl_agent():
-    env = MarioEnv('SuperMarioLand.gb', render=False)
+def train_rl_agent(headless=True):
+    env = MarioEnv('SuperMarioLand.gb', render=not headless)  # headless=True means no UI, False means UI
     model = PPO(
         "CnnPolicy",
         env,
@@ -192,7 +191,7 @@ def train_rl_agent():
     model.save("mario_ppo_model")
     print("=== Training Complete. Saved 'mario_ppo_model.zip' ===")
 
-    env = MarioEnv('SuperMarioLand.gb', render=True)
+    env = MarioEnv('SuperMarioLand.gb', render=True)  # Testing always with UI
     obs = env.reset()
     total_reward = 0
     for _ in range(2000):
@@ -208,4 +207,5 @@ def train_rl_agent():
 
 if __name__ == "__main__":
     main()
-    train_rl_agent()
+    # Switch between headless (True) and UI (False) mode here
+    train_rl_agent(headless=True)  # Default to headless mode
