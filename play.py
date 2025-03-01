@@ -72,7 +72,7 @@ class MarioEnv(gym.Env):
     def close(self):
         self.pyboy.stop()
 
-def play(model_path="mario_ppo_model.zip"):
+def play(model_path="mario_ppo_model_improved.zip"):
     env = MarioEnv('SuperMarioLand.gb', render=True)
     model = PPO.load(model_path)
     obs = env.reset()
