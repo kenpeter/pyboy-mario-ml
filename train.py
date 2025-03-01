@@ -188,16 +188,41 @@ class MarioEnv(gym.Env):
         current_coins = get_coins(self.pyboy)
         current_lives = get_lives(self.pyboy)
         current_world = get_world_level(self.pyboy)
-        progress_reward = abs(mario_x - self.prev_x) * 1  # Reward for any movement
-        coin_reward = (current_coins - self.prev_coins) * 50
-        survival_reward = 20
-        death_penalty = -100 if current_lives < self.prev_lives else 0
-        jump_reward = 20 if mario_y < 80 and self.prev_y >= 100 else 0
-        stall_penalty = -1 if mario_x == self.prev_x and mario_y >= 100 else 0
-        goomba_proximity = -10 if 110 <= mario_x <= 130 and mario_y >= 100 else 0
-        stage_complete = 2000 if current_world > self.prev_world else 0
-        return (progress_reward + coin_reward + survival_reward + death_penalty + 
-                jump_reward + stall_penalty + goomba_proximity + stage_complete)
+
+        # Reward for progress (moving right)
+        progress_reward = (mario_x - self.prev_x) * 2  # Reduced from 5 to 2
+
+        # Penalty for moving left
+        if mario_x < self.prev_x:
+            progress_reward = -1  # Reduced from -5 to -1
+
+        # Reward for collecting coins
+        coin_reward = (current_coins - self.prev_coins) * 5  # Reduced from 20 to 5
+
+        # Penalty for losing a life
+        death_penalty = -50 if current_lives < self.prev_lives else 0  # Reduced from -500 to -50
+
+        # Reward for surviving
+        survival_reward = 0.1  # Reduced from 1 to 0.1
+
+        # Reward for completing the stage
+        stage_complete = 100 if current_world > self.prev_world else 0  # Reduced from 500 to 100
+
+        # Reward for jumping (even if no enemy is present)
+        jump_reward = 5 if mario_y < self.prev_y else 0  # Reward any jump
+
+        # Total reward (normalized)
+        total_reward = (
+            progress_reward +
+            coin_reward +
+            survival_reward +
+            death_penalty +
+            stage_complete +
+            jump_reward
+        ) / 100  # Normalize rewards
+
+        return total_reward
+        
 
     def _is_done(self):
         """Check if the episode is done."""
@@ -254,79 +279,25 @@ class TransformerPolicy(ActorCriticPolicy):
         super(TransformerPolicy, self).__init__(*args, **kwargs, features_extractor_class=TransformerExtractor,
                                                features_extractor_kwargs={'feature_dim': 128})
 
-    def _build(self, lr_schedule):
-        """Build the actor and critic networks with learning rate schedule."""
-        if lr_schedule is not None:
-            self.lr_schedule = lr_schedule  # Store learning rate schedule if provided
-
-        # Build the actor and critic networks
-        self.actor = nn.Sequential(
-            nn.Linear(128, 64),  # Reduce dimensions
-            nn.ReLU(),
-            nn.Linear(64, self.action_space.n)  # Output for 5 actions
-        )
-        self.critic = nn.Sequential(
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1)  # Value output
-        )
-
-        # Initialize the optimizer
-        self.optimizer = torch.optim.Adam(self.parameters(), lr=lr_schedule(1))
-
-    def forward(self, obs, deterministic=False):
-        """Forward pass for policy and value."""
-        features = self.extract_features(obs)
-        logits = self.actor(features)  # Actor output as logits
-        value = self.critic(features)
-        dist = Categorical(logits=logits)  # Create a categorical distribution
-        if deterministic:
-            actions = dist.probs.argmax(dim=-1)  # Choose the action with the highest probability
-        else:
-            actions = dist.sample()  # Sample an action from the distribution
-        log_probs = dist.log_prob(actions)  # Log probabilities of the sampled actions
-        return actions, value, log_probs  # Return actions, values, and log_probs
-
-    def evaluate_actions(self, obs, actions):
-        """Evaluate actions for training."""
-        features = self.extract_features(obs)
-        values = self.critic(features)
-        logits = self.actor(features)
-        dist = Categorical(logits=logits)
-        log_probs = dist.log_prob(actions)
-        entropy = dist.entropy()
-        return values, log_probs, entropy
-
-    def predict_values(self, obs):
-        """Predict the value for a given observation."""
-        features = self.extract_features(obs)
-        return self.critic(features)
-
-    def get_distribution(self, obs):
-        """Get the action distribution for a given observation."""
-        features = self.extract_features(obs)
-        logits = self.actor(features)
-        return Categorical(logits=logits)
-
 def train_rl_agent(headless=True):
     """Train the RL agent with Transformer policy."""
     env = MarioEnv('SuperMarioLand.gb', render=not headless)
     model = PPO(
-        TransformerPolicy,  # Use custom Transformer policy directly
+        TransformerPolicy,  # Use custom Transformer policy
         env,
         verbose=1,
-        learning_rate=0.0003,
+        learning_rate=0.0001,  # Reduced learning rate
         n_steps=2048,
-        batch_size=64,
-        n_epochs=5,
+        batch_size=128,  # Increased batch size
+        n_epochs=10,  # Increased epochs
         gamma=0.99,
         gae_lambda=0.95,
         clip_range=0.2,
-        ent_coef=0.05
+        ent_coef=0.1,  # Increased entropy coefficient
     )
-    model.learn(total_timesteps=100000)  # Reduced to 100,000 steps (~20-25 minutes)
-    model.save("mario_ppo_model_improved")
-    print("=== Training Complete. Saved 'mario_ppo_model_improved.zip' ===")
+    model.learn(total_timesteps=1_000_000)  # Train for 1 million steps
+    model.save("mario_ppo_model_transformer_improved")
+    print("=== Training Complete. Saved 'mario_ppo_model_transformer_improved.zip' ===")
 
     env = MarioEnv('SuperMarioLand.gb', render=True)
     obs, _ = env.reset()  # Gymnasium requires unpacking observation and info
@@ -342,60 +313,6 @@ def train_rl_agent(headless=True):
             total_reward = 0
     env.close()
 
-def main():
-    """Run a simple AI demo before training."""
-    pyboy = PyBoy('SuperMarioLand.gb', window="SDL2")
-    target_fps = 60
-    frame_time = 1 / target_fps
-    last_time = time.time()
-    for i in range(600):
-        pyboy.tick()
-        if i == 300:
-            press_start(pyboy)
-        if get_lives(pyboy) > 0:
-            break
-    prev_lives = get_lives(pyboy)
-
-    try:
-        for _ in range(1000):
-            if not pyboy.tick():
-                break
-            mario_x, mario_y = get_mario_position(pyboy)
-            if 120 <= mario_x <= 130:  # Near Goomba-pipe section
-                stop_moving(pyboy)
-                move_left(pyboy)  # Move left to avoid Goombas
-                for _ in range(12):  # Move left for 12 ticks
-                    pyboy.tick()
-                stop_left(pyboy)
-                jump(pyboy)  # Jump over the pipe and Goombas
-                for _ in range(25):
-                    pyboy.tick()
-                stop_jumping(pyboy)
-                move_right(pyboy)
-            else:
-                move_right(pyboy)
-                if mario_y >= 100 or (mario_x % 20 == 0):
-                    jump(pyboy)
-                    for _ in range(10):
-                        pyboy.tick()
-                    stop_jumping(pyboy)
-            current_lives = get_lives(pyboy)
-            if current_lives < prev_lives:
-                pass
-            prev_lives = current_lives
-            if current_lives == 0:
-                break
-            current_time = time.time()
-            elapsed = current_time - last_time
-            if elapsed < frame_time:
-                time.sleep(frame_time - elapsed)
-            last_time = current_time
-    finally:
-        pyboy.stop()
-
 if __name__ == "__main__":
-    # Uncomment to run the main function for a simple AI demo
-    # main()
-    
-    # Train the RL agent with turbo mode enabled
+    # Train the RL agent
     train_rl_agent(headless=True)
