@@ -2,7 +2,7 @@ from pyboy import PyBoy
 from pyboy.utils import WindowEvent
 import time
 import numpy as np
-import gym
+import gymnasium as gym
 from stable_baselines3 import PPO
 import torch
 import torch.nn as nn
@@ -65,6 +65,16 @@ def press_start(pyboy):
         pyboy.tick()
     pyboy.send_input(WindowEvent.RELEASE_BUTTON_START)
 
+def enable_turbo_mode(pyboy):
+    """Enable turbo mode by pressing the space bar."""
+    pyboy.send_input(WindowEvent.PRESS_SPEED_UP)
+    pyboy.tick()  # Ensure the event is processed
+
+def disable_turbo_mode(pyboy):
+    """Disable turbo mode by releasing the space bar."""
+    pyboy.send_input(WindowEvent.RELEASE_SPEED_UP)
+    pyboy.tick()  # Ensure the event is processed
+
 class MarioEnv(gym.Env):
     def __init__(self, rom_path, render=False):
         """Initialize the Mario environment with ROM path and render option."""
@@ -74,6 +84,8 @@ class MarioEnv(gym.Env):
         self.pyboy = PyBoy(rom_path, window="SDL2" if render else "null")
         self.action_space = gym.spaces.Discrete(5)  # 5 actions: idle, right, jump, right+jump, left
         self.observation_space = gym.spaces.Box(low=0, high=255, shape=(144, 160, 3), dtype=np.uint8)
+        
+        # Initialize the game
         press_start(self.pyboy)
         for i in range(600):
             self.pyboy.tick()
@@ -81,6 +93,12 @@ class MarioEnv(gym.Env):
                 press_start(self.pyboy)
             if get_lives(self.pyboy) > 0:
                 break
+
+        # Delay turbo mode activation
+        if self.render_enabled:
+            time.sleep(5)  # Wait 5 seconds before enabling turbo mode
+            enable_turbo_mode(self.pyboy)
+
         self.prev_coins = get_coins(self.pyboy)
         self.prev_x = get_mario_position(self.pyboy)[0]
         self.prev_y = get_mario_position(self.pyboy)[1]
@@ -88,10 +106,12 @@ class MarioEnv(gym.Env):
         self.prev_world = get_world_level(self.pyboy)
         self.steps = 0
 
-    def reset(self):
+    def reset(self, seed=None, options=None):
         """Reset the environment to the initial state."""
         self.pyboy.stop(save=False)
         self.pyboy = PyBoy(self.rom_path, window="SDL2" if self.render_enabled else "null")
+        
+        # Initialize the game
         press_start(self.pyboy)
         for i in range(600):
             self.pyboy.tick()
@@ -99,13 +119,21 @@ class MarioEnv(gym.Env):
                 press_start(self.pyboy)
             if get_lives(self.pyboy) > 0:
                 break
+
+        # Delay turbo mode activation
+        if self.render_enabled:
+            time.sleep(5)  # Wait 5 seconds before enabling turbo mode
+            enable_turbo_mode(self.pyboy)
+
         self.prev_coins = get_coins(self.pyboy)
         self.prev_x = get_mario_position(self.pyboy)[0]
         self.prev_y = get_mario_position(self.pyboy)[1]
         self.prev_lives = get_lives(self.pyboy)
         self.prev_world = get_world_level(self.pyboy)
         self.steps = 0
-        return self._get_observation()
+        observation = self._get_observation()
+        info = {"steps": self.steps}  # Additional info
+        return observation, info  # Gymnasium requires returning observation and info
 
     def step(self, action):
         """Execute one step with the given action."""
@@ -139,13 +167,15 @@ class MarioEnv(gym.Env):
         self.steps += 1
         observation = self._get_observation()
         reward = self._get_reward()
-        done = self._is_done()
+        terminated = self._is_done()  # Gymnasium uses "terminated" instead of "done"
+        truncated = False  # Gymnasium requires a "truncated" flag (e.g., for time limits)
+        info = {"steps": self.steps}  # Additional info
         self.prev_coins = get_coins(self.pyboy)
         self.prev_x = get_mario_position(self.pyboy)[0]
         self.prev_y = get_mario_position(self.pyboy)[1]
         self.prev_lives = get_lives(self.pyboy)
         self.prev_world = get_world_level(self.pyboy)
-        return observation, reward, done, {"steps": self.steps}
+        return observation, reward, terminated, truncated, info  # Gymnasium requires 5 return values
 
     def _get_observation(self):
         """Get the current screen observation."""
@@ -182,6 +212,8 @@ class MarioEnv(gym.Env):
 
     def close(self):
         """Clean up the environment."""
+        if self.render_enabled:
+            disable_turbo_mode(self.pyboy)
         self.pyboy.stop()
 
 # Custom Transformer Feature Extractor
@@ -270,6 +302,12 @@ class TransformerPolicy(ActorCriticPolicy):
         features = self.extract_features(obs)
         return self.critic(features)
 
+    def get_distribution(self, obs):
+        """Get the action distribution for a given observation."""
+        features = self.extract_features(obs)
+        logits = self.actor(features)
+        return Categorical(logits=logits)
+
 def train_rl_agent(headless=True):
     """Train the RL agent with Transformer policy."""
     env = MarioEnv('SuperMarioLand.gb', render=not headless)
@@ -291,20 +329,19 @@ def train_rl_agent(headless=True):
     print("=== Training Complete. Saved 'mario_ppo_model_improved.zip' ===")
 
     env = MarioEnv('SuperMarioLand.gb', render=True)
-    obs = env.reset()
+    obs, _ = env.reset()  # Gymnasium requires unpacking observation and info
     total_reward = 0
     for _ in range(5000):
         action, _ = model.predict(obs)
-        obs, reward, done, info = env.step(action)
+        obs, reward, terminated, truncated, info = env.step(action)
         total_reward += reward
         env.render()
-        if done:
+        if terminated or truncated:
             print(f"Episode ended. Total Reward: {total_reward}, Steps: {info['steps']}")
-            obs = env.reset()
+            obs, _ = env.reset()
             total_reward = 0
     env.close()
 
-'''
 def main():
     """Run a simple AI demo before training."""
     pyboy = PyBoy('SuperMarioLand.gb', window="SDL2")
@@ -355,9 +392,10 @@ def main():
             last_time = current_time
     finally:
         pyboy.stop()
-'''
 
 if __name__ == "__main__":
-    # Comment out the main function as requested
+    # Uncomment to run the main function for a simple AI demo
     # main()
+    
+    # Train the RL agent with turbo mode enabled
     train_rl_agent(headless=True)
