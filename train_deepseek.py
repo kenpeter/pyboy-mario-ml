@@ -190,27 +190,30 @@ class MarioEnv(gym.Env):
         current_world = get_world_level(self.pyboy)
 
         # Stronger reward for progressing right
-        progress_reward = (mario_x - self.prev_x) * 30 if mario_x > self.prev_x else 0
+        progress_reward = (mario_x - self.prev_x) * 50 if mario_x > self.prev_x else 0
 
         # Penalty for moving left or stalling
-        movement_penalty = -2 if mario_x <= self.prev_x else 0
+        movement_penalty = -5 if mario_x <= self.prev_x else 0
 
         # Reward for collecting coins
-        coin_reward = (current_coins - self.prev_coins) * 30
+        coin_reward = (current_coins - self.prev_coins) * 50
 
-        # Penalty for losing a life (less harsh)
-        death_penalty = -50 if current_lives < self.prev_lives else 0
+        # Penalty for losing a life
+        death_penalty = -100 if current_lives < self.prev_lives else 0
 
         # Small survival bonus
         survival_reward = 1.0
 
-        # Reward for completing a stage (very strong incentive)
-        stage_complete = 500 if current_world > self.prev_world else 0
+        # Reward for completing a stage
+        stage_complete = 1000 if current_world > self.prev_world else 0
 
         # Reward for jumping (encourage avoiding obstacles or hitting blocks)
-        jump_reward = 30 if mario_y < self.prev_y else 0
+        jump_reward = 50 if mario_y < self.prev_y else 0
 
-        # Total reward with normalization
+        # Time penalty to encourage faster progression
+        time_penalty = -0.1
+
+        # Total reward
         total_reward = (
             progress_reward +
             movement_penalty +
@@ -218,7 +221,8 @@ class MarioEnv(gym.Env):
             survival_reward +
             death_penalty +
             stage_complete +
-            jump_reward
+            jump_reward +
+            time_penalty
         ) / 50  # Adjusted normalization factor for balance
 
         return total_reward
@@ -285,16 +289,16 @@ def train_rl_agent(headless=True):
         TransformerPolicy,  # Use custom Transformer policy
         env,
         verbose=1,
-        learning_rate=0.0003,  # Increased learning rate for faster training
-        n_steps=1024,  # Increased number of steps per update
-        batch_size=64,  # Larger batch size for stability
-        n_epochs=5,  # More epochs for better learning
+        learning_rate=0.0001,  # Smaller learning rate for stability
+        n_steps=2048,  # Increased number of steps per update
+        batch_size=128,  # Larger batch size for stability
+        n_epochs=10,  # More epochs for better learning
         gamma=0.99,
         gae_lambda=0.95,
         clip_range=0.2,
         ent_coef=0.2,  # Increased entropy coefficient for exploration
     )
-    model.learn(total_timesteps=100_000)  # Train for 100,000 steps
+    model.learn(total_timesteps=1_000_000)  # Train for 1,000,000 steps
     model.save("mario_ppo_model_transformer_improved")
     print("=== Training Complete. Saved 'mario_ppo_model_transformer_improved.zip' ===")
 
@@ -342,7 +346,7 @@ def play_trained_model(model_path="mario_ppo_model_transformer_improved.zip"):
 # Update the main block to optionally run training or play mode
 if __name__ == "__main__":
     # To train the agent:
-    # train_rl_agent(headless=True)
+    train_rl_agent(headless=True)
     
     # To play with the trained model:
-    play_trained_model()
+    #play_trained_model()
