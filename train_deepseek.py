@@ -183,43 +183,43 @@ class MarioEnv(gym.Env):
         return screen_image[:, :, :3] if screen_image.shape[-1] == 4 else screen_image
 
     def _get_reward(self):
-        """Calculate the reward based on current state."""
+        """Calculate the reward based on current state with refined incentives."""
         mario_x, mario_y = get_mario_position(self.pyboy)
         current_coins = get_coins(self.pyboy)
         current_lives = get_lives(self.pyboy)
         current_world = get_world_level(self.pyboy)
 
-        # Reward for progress (moving right)
-        progress_reward = (mario_x - self.prev_x) * 2  # Reduced from 5 to 2
+        # Reward for progressing right (stronger incentive)
+        progress_reward = (mario_x - self.prev_x) * 3 if mario_x > self.prev_x else 0
 
-        # Penalty for moving left
-        if mario_x < self.prev_x:
-            progress_reward = -1  # Reduced from -5 to -1
+        # Penalty for moving left or stalling
+        movement_penalty = -0.5 if mario_x <= self.prev_x else 0
 
-        # Reward for collecting coins
-        coin_reward = (current_coins - self.prev_coins) * 5  # Reduced from 20 to 5
+        # Reward for collecting coins (moderate incentive)
+        coin_reward = (current_coins - self.prev_coins) * 10
 
-        # Penalty for losing a life
-        death_penalty = -50 if current_lives < self.prev_lives else 0  # Reduced from -500 to -50
+        # Penalty for losing a life (significant but not overwhelming)
+        death_penalty = -75 if current_lives < self.prev_lives else 0
 
-        # Reward for surviving
-        survival_reward = 0.1  # Reduced from 1 to 0.1
+        # Small survival bonus
+        survival_reward = 0.2
 
-        # Reward for completing the stage
-        stage_complete = 100 if current_world > self.prev_world else 0  # Reduced from 500 to 100
+        # Reward for completing a stage (strong incentive)
+        stage_complete = 150 if current_world > self.prev_world else 0
 
-        # Reward for jumping (even if no enemy is present)
-        jump_reward = 5 if mario_y < self.prev_y else 0  # Reward any jump
+        # Reward for jumping (encourages avoiding obstacles or hitting blocks)
+        jump_reward = 8 if mario_y < self.prev_y else 0
 
-        # Total reward (normalized)
+        # Total reward with normalization
         total_reward = (
             progress_reward +
+            movement_penalty +
             coin_reward +
             survival_reward +
             death_penalty +
             stage_complete +
             jump_reward
-        ) / 100  # Normalize rewards
+        ) / 50  # Adjusted normalization factor for balance
 
         return total_reward
 
@@ -295,8 +295,8 @@ def train_rl_agent(headless=True):
         ent_coef=0.1,  # Increased entropy coefficient
     )
     model.learn(total_timesteps=1_000_000)  # Train for 1 million steps
-    model.save("mario_ppo_model_transformer_improved")
-    print("=== Training Complete. Saved 'mario_ppo_model_transformer_improved.zip' ===")
+    model.save("deepseek")
+    print("=== Training Complete. Saved 'deepseek.zip' ===")
 
     env = MarioEnv('SuperMarioLand.gb', render=True)
     obs, _ = env.reset()  # Gymnasium requires unpacking observation and info
@@ -312,6 +312,37 @@ def train_rl_agent(headless=True):
             total_reward = 0
     env.close()
 
+def play_trained_model(model_path="deepseek.zip"):
+    """Load and run the trained model to play Super Mario Land interactively."""
+    # Initialize environment with rendering enabled
+    env = MarioEnv('SuperMarioLand.gb', render=True)
+    
+    # Load the trained model
+    model = PPO.load(model_path, env=env)
+    
+    obs, _ = env.reset()
+    total_reward = 0
+    
+    try:
+        while True:  # Run until manually interrupted
+            action, _ = model.predict(obs)
+            obs, reward, terminated, truncated, info = env.step(action)
+            total_reward += reward
+            
+            if terminated or truncated:
+                print(f"Episode ended! Total Reward: {total_reward:.2f}, Steps: {info['steps']}")
+                obs, _ = env.reset()
+                total_reward = 0
+                
+    except KeyboardInterrupt:
+        print("\nPlay session interrupted by user.")
+    finally:
+        env.close()
+
+# Update the main block to optionally run training or play mode
 if __name__ == "__main__":
-    # Train the RL agent
-    train_rl_agent(headless=True)
+    # To train the agent:
+    #train_rl_agent(headless=True)
+    
+    # To play with the trained model:
+    play_trained_model()

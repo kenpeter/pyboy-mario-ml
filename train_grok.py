@@ -196,21 +196,21 @@ class MarioEnv(gym.Env):
         movement_penalty = -0.5 if mario_x <= self.prev_x else 0
 
         # Reward for collecting coins (moderate incentive)
-        coin_reward = (current_coins - self.prev_coins) * 10
+        coin_reward = (current_coins - self.prev_coins) * 5
 
         # Penalty for losing a life (significant but not overwhelming)
-        death_penalty = -75 if current_lives < self.prev_lives else 0
+        death_penalty = -50 if current_lives < self.prev_lives else 0
 
-        # Small survival bonus
-        survival_reward = 0.2
+        # Reward for surviving
+        survival_reward = 0.1
 
-        # Reward for completing a stage (strong incentive)
-        stage_complete = 150 if current_world > self.prev_world else 0
+        # Reward for completing the stage
+        stage_complete = 100 if current_world > self.prev_world else 0
 
-        # Reward for jumping (encourages avoiding obstacles or hitting blocks)
-        jump_reward = 8 if mario_y < self.prev_y else 0
+        # Reward for jumping (even if no enemy is present)
+        jump_reward = 5 if mario_y < self.prev_y else 0
 
-        # Total reward with normalization
+        # Total reward (normalized)
         total_reward = (
             progress_reward +
             movement_penalty +
@@ -219,7 +219,7 @@ class MarioEnv(gym.Env):
             death_penalty +
             stage_complete +
             jump_reward
-        ) / 50  # Adjusted normalization factor for balance
+        ) / 100  # Normalize rewards
 
         return total_reward
 
@@ -274,9 +274,39 @@ class TransformerExtractor(BaseFeaturesExtractor):
 # Custom Transformer Policy
 class TransformerPolicy(ActorCriticPolicy):
     def __init__(self, *args, **kwargs):
-        """Initialize Transformer-based policy."""
-        super(TransformerPolicy, self).__init__(*args, **kwargs, features_extractor_class=TransformerExtractor,
-                                               features_extractor_kwargs={'feature_dim': 128})
+        """Initialize Transformer-based policy with actor and critic networks."""
+        super(TransformerPolicy, self).__init__(
+            *args,
+            **kwargs,
+            features_extractor_class=TransformerExtractor,
+            features_extractor_kwargs={'feature_dim': 128}
+        )
+        # Define actor and critic networks
+        self.actor = nn.Linear(128, self.action_space.n)  # Action logits for 5 actions
+        self.critic = nn.Linear(128, 1)  # Value estimate
+
+    def forward(self, obs, deterministic=False):
+        """Forward pass for policy and value, returning actions, values, and log_probs."""
+        features = self.extract_features(obs)
+        logits = self.actor(features)
+        values = self.critic(features)
+        dist = Categorical(logits=logits)
+        actions = dist.mode() if deterministic else dist.sample()
+        log_probs = dist.log_prob(actions)
+        return actions, values, log_probs  # Return three values as required by PPO
+
+    def predict(self, obs, deterministic=False):
+        """Predict an action given an observation."""
+        with torch.no_grad():
+            # Ensure obs is a tensor and add batch dimension if needed
+            obs_tensor = torch.as_tensor(obs, device=self.device)
+            if obs_tensor.dim() == 3:  # Add batch dimension for single observation
+                obs_tensor = obs_tensor.unsqueeze(0)
+            actions, values, _ = self.forward(obs_tensor, deterministic)
+            # Squeeze to remove batch dimension and convert to NumPy
+            actions = actions.squeeze().cpu().numpy()
+            values = values.squeeze().cpu().numpy()
+            return actions, values
 
 def train_rl_agent(headless=True):
     """Train the RL agent with Transformer policy."""
@@ -295,8 +325,8 @@ def train_rl_agent(headless=True):
         ent_coef=0.1,  # Increased entropy coefficient
     )
     model.learn(total_timesteps=1_000_000)  # Train for 1 million steps
-    model.save("mario_ppo_model_transformer_improved")
-    print("=== Training Complete. Saved 'mario_ppo_model_transformer_improved.zip' ===")
+    model.save("grok")
+    print("=== Training Complete. Saved 'grok.zip' ===")
 
     env = MarioEnv('SuperMarioLand.gb', render=True)
     obs, _ = env.reset()  # Gymnasium requires unpacking observation and info
@@ -312,6 +342,53 @@ def train_rl_agent(headless=True):
             total_reward = 0
     env.close()
 
+def play(model_path="grok.zip"):
+    """Load the trained model and play the game with debugging to address movement issues."""
+    try:
+        env = MarioEnv('SuperMarioLand.gb', render=True)
+        model = PPO.load(model_path)
+        print("Model loaded successfully!")
+        print(f"Loaded model policy class: {model.policy.__class__.__name__}")  # Debug policy class
+        obs, _ = env.reset()
+        total_reward = 0
+        action_counts = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0}  # Track action distribution
+        prev_x = get_mario_position(env.pyboy)[0]  # Track previous x-position
+        for step in range(5000):
+            # Debug the raw prediction output
+            raw_action, _ = model.predict(obs, deterministic=True)
+            print(f"Step {step}, Raw prediction: {raw_action}, Type: {type(raw_action)}")
+            # Extract action based on type
+            if isinstance(raw_action, Categorical):
+                action = raw_action.mode().item()
+            elif isinstance(raw_action, np.ndarray):
+                action = raw_action.item() if raw_action.size == 1 else raw_action[0]
+            elif isinstance(raw_action, torch.Tensor):
+                action = raw_action.item() if raw_action.dim() == 0 else raw_action[0].item()
+            else:
+                raise ValueError(f"Unexpected action type: {type(raw_action)}")
+            action_counts[action] += 1
+            print(f"Step {step}, Action predicted: {action}")
+            # Log Mario's position
+            current_x, current_y = get_mario_position(env.pyboy)
+            delta_x = current_x - prev_x
+            print(f"Step {step}, Mario position (x, y): ({current_x}, {current_y}), Delta x: {delta_x}")
+            obs, reward, terminated, truncated, info = env.step(action)
+            total_reward += reward
+            env.render()
+            prev_x = current_x  # Update previous x-position
+            time.sleep(0.01)  # Prevent quick shutdown
+            if terminated or truncated:
+                print(f"Episode ended at step {step}. Total Reward: {total_reward}, Steps: {info['steps']}")
+                print(f"Action distribution: {action_counts}")
+                obs, _ = env.reset()
+                total_reward = 0
+                action_counts = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0}
+                prev_x = get_mario_position(env.pyboy)[0]  # Reset prev_x
+        env.close()
+    except Exception as e:
+        print(f"Error during play: {e}")
+
 if __name__ == "__main__":
-    # Train the RL agent
-    train_rl_agent(headless=True)
+    # Train the RL agent or play
+    train_rl_agent(headless=True)  # Uncomment to train
+    #play(model_path="grok.zip")  # Play with the new trained model
