@@ -190,25 +190,25 @@ class MarioEnv(gym.Env):
         current_world = get_world_level(self.pyboy)
 
         # Stronger reward for progressing right
-        progress_reward = (mario_x - self.prev_x) * 5 if mario_x > self.prev_x else 0
+        progress_reward = (mario_x - self.prev_x) * 30 if mario_x > self.prev_x else 0
 
         # Penalty for moving left or stalling
-        movement_penalty = -1 if mario_x <= self.prev_x else 0
+        movement_penalty = -2 if mario_x <= self.prev_x else 0
 
         # Reward for collecting coins
-        coin_reward = (current_coins - self.prev_coins) * 20
+        coin_reward = (current_coins - self.prev_coins) * 30
 
         # Penalty for losing a life (less harsh)
         death_penalty = -50 if current_lives < self.prev_lives else 0
 
         # Small survival bonus
-        survival_reward = 0.5
+        survival_reward = 1.0
 
         # Reward for completing a stage (very strong incentive)
-        stage_complete = 300 if current_world > self.prev_world else 0
+        stage_complete = 500 if current_world > self.prev_world else 0
 
         # Reward for jumping (encourage avoiding obstacles or hitting blocks)
-        jump_reward = 10 if mario_y < self.prev_y else 0
+        jump_reward = 30 if mario_y < self.prev_y else 0
 
         # Total reward with normalization
         total_reward = (
@@ -286,17 +286,17 @@ def train_rl_agent(headless=True):
         env,
         verbose=1,
         learning_rate=0.0003,  # Increased learning rate for faster training
-        n_steps=512,  # Reduced number of steps per update
-        batch_size=32,  # Smaller batch size for faster updates
-        n_epochs=3,  # Fewer epochs for faster training
+        n_steps=1024,  # Increased number of steps per update
+        batch_size=64,  # Larger batch size for stability
+        n_epochs=5,  # More epochs for better learning
         gamma=0.99,
         gae_lambda=0.95,
         clip_range=0.2,
         ent_coef=0.2,  # Increased entropy coefficient for exploration
     )
-    model.learn(total_timesteps=50_000)  # Train for 50,000 steps (faster training)
-    model.save("mario_ppo_model_transformer_fast")
-    print("=== Training Complete. Saved 'mario_ppo_model_transformer_fast.zip' ===")
+    model.learn(total_timesteps=100_000)  # Train for 100,000 steps
+    model.save("mario_ppo_model_transformer_improved")
+    print("=== Training Complete. Saved 'mario_ppo_model_transformer_improved.zip' ===")
 
     env = MarioEnv('SuperMarioLand.gb', render=True)
     obs, _ = env.reset()  # Gymnasium requires unpacking observation and info
@@ -312,6 +312,37 @@ def train_rl_agent(headless=True):
             total_reward = 0
     env.close()
 
+def play_trained_model(model_path="mario_ppo_model_transformer_improved.zip"):
+    """Load and run the trained model to play Super Mario Land interactively."""
+    # Initialize environment with rendering enabled
+    env = MarioEnv('SuperMarioLand.gb', render=True)
+    
+    # Load the trained model
+    model = PPO.load(model_path, env=env)
+    
+    obs, _ = env.reset()
+    total_reward = 0
+    
+    try:
+        while True:  # Run until manually interrupted
+            action, _ = model.predict(obs)
+            obs, reward, terminated, truncated, info = env.step(action)
+            total_reward += reward
+            
+            if terminated or truncated:
+                print(f"Episode ended! Total Reward: {total_reward:.2f}, Steps: {info['steps']}")
+                obs, _ = env.reset()
+                total_reward = 0
+                
+    except KeyboardInterrupt:
+        print("\nPlay session interrupted by user.")
+    finally:
+        env.close()
+
+# Update the main block to optionally run training or play mode
 if __name__ == "__main__":
-    # Train the RL agent
-    train_rl_agent(headless=True)
+    # To train the agent:
+    # train_rl_agent(headless=True)
+    
+    # To play with the trained model:
+    play_trained_model()
