@@ -189,26 +189,26 @@ class MarioEnv(gym.Env):
         current_lives = get_lives(self.pyboy)
         current_world = get_world_level(self.pyboy)
 
-        # Reward for progressing right (stronger incentive)
-        progress_reward = (mario_x - self.prev_x) * 3 if mario_x > self.prev_x else 0
+        # Stronger reward for progressing right
+        progress_reward = (mario_x - self.prev_x) * 5 if mario_x > self.prev_x else 0
 
         # Penalty for moving left or stalling
-        movement_penalty = -0.5 if mario_x <= self.prev_x else 0
+        movement_penalty = -1 if mario_x <= self.prev_x else 0
 
-        # Reward for collecting coins (moderate incentive)
-        coin_reward = (current_coins - self.prev_coins) * 10
+        # Reward for collecting coins
+        coin_reward = (current_coins - self.prev_coins) * 20
 
-        # Penalty for losing a life (significant but not overwhelming)
-        death_penalty = -75 if current_lives < self.prev_lives else 0
+        # Penalty for losing a life (less harsh)
+        death_penalty = -50 if current_lives < self.prev_lives else 0
 
         # Small survival bonus
-        survival_reward = 0.2
+        survival_reward = 0.5
 
-        # Reward for completing a stage (strong incentive)
-        stage_complete = 150 if current_world > self.prev_world else 0
+        # Reward for completing a stage (very strong incentive)
+        stage_complete = 300 if current_world > self.prev_world else 0
 
-        # Reward for jumping (encourages avoiding obstacles or hitting blocks)
-        jump_reward = 8 if mario_y < self.prev_y else 0
+        # Reward for jumping (encourage avoiding obstacles or hitting blocks)
+        jump_reward = 10 if mario_y < self.prev_y else 0
 
         # Total reward with normalization
         total_reward = (
@@ -285,18 +285,18 @@ def train_rl_agent(headless=True):
         TransformerPolicy,  # Use custom Transformer policy
         env,
         verbose=1,
-        learning_rate=0.0001,  # Reduced learning rate
-        n_steps=2048,
-        batch_size=128,  # Increased batch size
-        n_epochs=10,  # Increased epochs
+        learning_rate=0.0003,  # Increased learning rate for faster training
+        n_steps=512,  # Reduced number of steps per update
+        batch_size=32,  # Smaller batch size for faster updates
+        n_epochs=3,  # Fewer epochs for faster training
         gamma=0.99,
         gae_lambda=0.95,
         clip_range=0.2,
-        ent_coef=0.1,  # Increased entropy coefficient
+        ent_coef=0.2,  # Increased entropy coefficient for exploration
     )
-    model.learn(total_timesteps=1_000_000)  # Train for 1 million steps
-    model.save("deepseek")
-    print("=== Training Complete. Saved 'deepseek.zip' ===")
+    model.learn(total_timesteps=50_000)  # Train for 50,000 steps (faster training)
+    model.save("mario_ppo_model_transformer_fast")
+    print("=== Training Complete. Saved 'mario_ppo_model_transformer_fast.zip' ===")
 
     env = MarioEnv('SuperMarioLand.gb', render=True)
     obs, _ = env.reset()  # Gymnasium requires unpacking observation and info
@@ -312,37 +312,6 @@ def train_rl_agent(headless=True):
             total_reward = 0
     env.close()
 
-def play_trained_model(model_path="deepseek.zip"):
-    """Load and run the trained model to play Super Mario Land interactively."""
-    # Initialize environment with rendering enabled
-    env = MarioEnv('SuperMarioLand.gb', render=True)
-    
-    # Load the trained model
-    model = PPO.load(model_path, env=env)
-    
-    obs, _ = env.reset()
-    total_reward = 0
-    
-    try:
-        while True:  # Run until manually interrupted
-            action, _ = model.predict(obs)
-            obs, reward, terminated, truncated, info = env.step(action)
-            total_reward += reward
-            
-            if terminated or truncated:
-                print(f"Episode ended! Total Reward: {total_reward:.2f}, Steps: {info['steps']}")
-                obs, _ = env.reset()
-                total_reward = 0
-                
-    except KeyboardInterrupt:
-        print("\nPlay session interrupted by user.")
-    finally:
-        env.close()
-
-# Update the main block to optionally run training or play mode
 if __name__ == "__main__":
-    # To train the agent:
-    #train_rl_agent(headless=True)
-    
-    # To play with the trained model:
-    play_trained_model()
+    # Train the RL agent
+    train_rl_agent(headless=True)
