@@ -222,7 +222,6 @@ class MarioEnv(gym.Env):
         ) / 100  # Normalize rewards
 
         return total_reward
-        
 
     def _is_done(self):
         """Check if the episode is done."""
