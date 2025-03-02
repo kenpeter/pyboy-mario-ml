@@ -82,7 +82,7 @@ class MarioEnv(gym.Env):
         self.rom_path = rom_path
         self.render_enabled = render
         self.pyboy = PyBoy(rom_path, window="SDL2" if render else "null")
-        self.action_space = gym.spaces.Discrete(5)  # 5 actions: idle, right, jump, right+jump, left
+        self.action_space = gym.spaces.Discrete(7)  # 7 actions: idle, right, jump, right+jump, left, long jump, run+jump
         self.observation_space = gym.spaces.Box(low=0, high=255, shape=(144, 160, 3), dtype=np.uint8)
         
         # Initialize the game
@@ -163,6 +163,17 @@ class MarioEnv(gym.Env):
             for _ in range(4):
                 self.pyboy.tick()
             stop_left(self.pyboy)
+        elif action == 5:  # Long jump
+            jump(self.pyboy)
+            for _ in range(40):  # Longer jump duration
+                self.pyboy.tick()
+            stop_jumping(self.pyboy)
+        elif action == 6:  # Run + jump
+            move_right(self.pyboy)
+            jump(self.pyboy)
+            for _ in range(40):  # Longer jump duration
+                self.pyboy.tick()
+            stop_jumping(self.pyboy)
 
         self.steps += 1
         observation = self._get_observation()
@@ -190,28 +201,28 @@ class MarioEnv(gym.Env):
         current_world = get_world_level(self.pyboy)
 
         # Stronger reward for progressing right
-        progress_reward = (mario_x - self.prev_x) * 50 if mario_x > self.prev_x else 0
+        progress_reward = (mario_x - self.prev_x) * 100 if mario_x > self.prev_x else 0
 
         # Penalty for moving left or stalling
-        movement_penalty = -5 if mario_x <= self.prev_x else 0
+        movement_penalty = -10 if mario_x <= self.prev_x else 0
 
         # Reward for collecting coins
-        coin_reward = (current_coins - self.prev_coins) * 50
+        coin_reward = (current_coins - self.prev_coins) * 100
 
         # Penalty for losing a life
-        death_penalty = -100 if current_lives < self.prev_lives else 0
+        death_penalty = -200 if current_lives < self.prev_lives else 0
 
         # Small survival bonus
         survival_reward = 1.0
 
-        # Reward for completing a stage
-        stage_complete = 1000 if current_world > self.prev_world else 0
+        # Large reward for completing a stage
+        stage_complete = 2000 if current_world > self.prev_world else 0
 
         # Reward for jumping (encourage avoiding obstacles or hitting blocks)
-        jump_reward = 50 if mario_y < self.prev_y else 0
+        jump_reward = 100 if mario_y < self.prev_y else 0
 
         # Time penalty to encourage faster progression
-        time_penalty = -0.1
+        time_penalty = -0.5
 
         # Total reward
         total_reward = (
@@ -283,24 +294,24 @@ class TransformerPolicy(ActorCriticPolicy):
                                                features_extractor_kwargs={'feature_dim': 128})
 
 def train_rl_agent(headless=True):
-    """Train the RL agent with Transformer policy."""
+    """Train the RL agent with improved settings."""
     env = MarioEnv('SuperMarioLand.gb', render=not headless)
     model = PPO(
-        TransformerPolicy,  # Use custom Transformer policy
+        TransformerPolicy,
         env,
         verbose=1,
-        learning_rate=0.0001,  # Smaller learning rate for stability
-        n_steps=2048,  # Increased number of steps per update
-        batch_size=128,  # Larger batch size for stability
-        n_epochs=10,  # More epochs for better learning
+        learning_rate=0.0001,
+        n_steps=2048,
+        batch_size=128,
+        n_epochs=10,
         gamma=0.99,
         gae_lambda=0.95,
         clip_range=0.2,
-        ent_coef=0.2,  # Increased entropy coefficient for exploration
+        ent_coef=0.3,
     )
-    model.learn(total_timesteps=1_000_000)  # Train for 1,000,000 steps
-    model.save("mario_ppo_model_transformer_improved")
-    print("=== Training Complete. Saved 'mario_ppo_model_transformer_improved.zip' ===")
+    model.learn(total_timesteps=100_000)  # Train for 100,000 steps
+    model.save("deepseek")
+    print("=== Training Complete. Saved 'deepseek.zip' ===")
 
     env = MarioEnv('SuperMarioLand.gb', render=True)
     obs, _ = env.reset()  # Gymnasium requires unpacking observation and info
@@ -316,7 +327,7 @@ def train_rl_agent(headless=True):
             total_reward = 0
     env.close()
 
-def play_trained_model(model_path="mario_ppo_model_transformer_improved.zip"):
+def play_trained_model(model_path="deepseek.zip"):
     """Load and run the trained model to play Super Mario Land interactively."""
     # Initialize environment with rendering enabled
     env = MarioEnv('SuperMarioLand.gb', render=True)
