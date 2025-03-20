@@ -1,0 +1,20 @@
+# requirements.txt
+
+# Core dependencies for PyBoy and emulation
+pyboy>=2.0.0  # PyBoy Game Boy emulator
+
+# Reinforcement learning and gymnasium
+gymnasium>=0.29.1  # Modern Gym environment API
+stable-baselines3>=2.3.0  # RL algorithms like PPO
+
+# Numerical and array handling
+numpy>=1.24.0  # Array operations
+
+# PyTorch for neural networks
+torch>=2.2.0  # PyTorch core library
+
+# Logging and system utilities (standard library, no need to install)
+# logging, signal, sys, os are built-in
+
+# Optional: For rendering if using SDL2 window (may require system-level SDL2 installation)
+# pysdl2>=0.9.16  # Not strictly required unless explicitly importing SDL2 outside PyBoy
