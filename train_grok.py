@@ -56,7 +56,7 @@ class MarioEnv(gym.Env):
         self.pyboy = PyBoy(rom_path, window="SDL2" if render else "null", sound=False)
         self.action_space = gym.spaces.Discrete(8)
         self.observation_space = gym.spaces.Box(low=0, high=255, shape=(144, 160, 3), dtype=np.uint8)
-        self.render_mode = "human" if render else None  # Specify render_mode
+        self.render_mode = "human" if render else None
         
         press_start(self.pyboy)
         for i in range(600):
@@ -187,10 +187,10 @@ class MarioEnv(gym.Env):
         current_coins = get_coins(self.pyboy)
         current_lives = get_lives(self.pyboy)
         current_world = get_world_level(self.pyboy)
-        progress_reward = (mario_x - self.prev_x) * 1.0 if mario_x > self.prev_x else 0
+        progress_reward = (mario_x - self.prev_x) * 2.0 if mario_x > self.prev_x else 0
         movement_penalty = -0.01 if mario_x <= self.prev_x else 0
         coin_reward = (current_coins - self.prev_coins) * 5.0
-        death_penalty = -15.0 if current_lives < self.prev_lives else 0
+        death_penalty = -50.0 if current_lives < self.prev_lives else 0
         survival_reward = 0.05
         stage_complete = 50.0 if current_world > self.prev_world else 0
         jump_reward = 0.1 if mario_y < self.prev_y and mario_x > self.prev_x else 0
@@ -228,7 +228,7 @@ class MarioEnv(gym.Env):
             logger.error(f"Failed to load state from {path}: {e}")
 
 class MambaExtractor(BaseFeaturesExtractor):
-    def __init__(self, observation_space: gym.spaces.Box, feature_dim: int = 128):
+    def __init__(self, observation_space: gym.spaces.Box, feature_dim: int = 256):
         super(MambaExtractor, self).__init__(observation_space, feature_dim)
         self.image_channels, self.image_height, self.image_width = observation_space.shape
         self.patch_size = 16
@@ -271,10 +271,10 @@ class MambaPolicy(ActorCriticPolicy):
             *args,
             **kwargs,
             features_extractor_class=MambaExtractor,
-            features_extractor_kwargs={'feature_dim': 128}
+            features_extractor_kwargs={'feature_dim': 256}
         )
-        self.actor = nn.Linear(128, self.action_space.n)
-        self.critic = nn.Linear(128, 1)
+        self.actor = nn.Linear(256, self.action_space.n)
+        self.critic = nn.Linear(256, 1)
 
     def forward(self, obs, deterministic=False):
         features = self.extract_features(obs)
@@ -326,7 +326,7 @@ class AutosaveCallback(BaseCallback):
             self.model.save("grok_mamba_autosave")
             self.last_save = total_timesteps_so_far
 
-def train_rl_agent(render=False, resume=False):
+def train_rl_agent(render=False, resume=False, use_cuda=False):
     base_env = MarioEnv('SuperMarioLand.gb', render=render)
     logger.info(f"Base observation space: {base_env.observation_space}")
     env = Monitor(base_env)
@@ -336,13 +336,16 @@ def train_rl_agent(render=False, resume=False):
     model_path = "grok_mamba.zip"
     total_training_timesteps = 1_000_000
     
+    # Determine device based on --cuda flag and availability
+    device = 'cuda' if use_cuda and torch.cuda.is_available() else 'cpu'
+    logger.info(f"Using device: {device}")
+    if use_cuda and not torch.cuda.is_available():
+        logger.warning("CUDA requested but not available, falling back to CPU")
+
     if resume and os.path.exists(model_path):
-        model = PPO.load(model_path, env=env)
+        model = PPO.load(model_path, env=env, device=device)
         initial_timesteps = model.num_timesteps
         remaining_timesteps = total_training_timesteps - initial_timesteps
-        if remaining_timesteps <= 0:
-            logger.info(f"Model already trained for {initial_timesteps} timesteps, which meets or exceeds target {total_training_timesteps}")
-            return
         logger.info(f"Resuming training from {initial_timesteps} timesteps, {remaining_timesteps} timesteps remaining")
     else:
         model = PPO(
@@ -358,10 +361,11 @@ def train_rl_agent(render=False, resume=False):
             clip_range=0.2,
             ent_coef=1.0,
             vf_coef=1.0,
-            device='cuda' if torch.cuda.is_available() else 'cpu'
+            device=device
         )
         initial_timesteps = 0
         remaining_timesteps = total_training_timesteps
+        logger.info("Starting fresh training, ignoring existing model if any")
 
     signal.signal(signal.SIGINT, lambda sig, frame: signal_handler(sig, frame, base_env, model))
     logger.info("Signal handler registered for SIGINT")
@@ -404,13 +408,20 @@ def train_rl_agent(render=False, resume=False):
             total_reward = 0
     play_env.close()
 
-def play(model_path="grok_mamba.zip", state_path="mario_state.sav"):
+def play(model_path="grok_mamba.zip", state_path="mario_state.sav", use_cuda=False):
     try:
         base_env = MarioEnv('SuperMarioLand.gb', render=True)
         env = Monitor(base_env)
         env = DummyVecEnv([lambda: base_env])
         env = VecTransposeImage(env)
-        model = PPO.load(model_path)
+        
+        # Determine device for play
+        device = 'cuda' if use_cuda and torch.cuda.is_available() else 'cpu'
+        logger.info(f"Using device for play: {device}")
+        if use_cuda and not torch.cuda.is_available():
+            logger.warning("CUDA requested but not available, falling back to CPU")
+        
+        model = PPO.load(model_path, device=device)
         logger.info("Model loaded successfully!")
         logger.info(f"Loaded model policy class: {model.policy.__class__.__name__}")
         
@@ -422,7 +433,7 @@ def play(model_path="grok_mamba.zip", state_path="mario_state.sav"):
         action_counts = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0}
         prev_x = get_mario_position(base_env.pyboy)[0]
         for step in range(5000):
-            raw_action, _ = model.predict(obs, deterministic=False)
+            raw_action, _ = model.predict(obs, deterministic=True)
             if isinstance(raw_action, np.ndarray):
                 action = raw_action.item() if raw_action.size == 1 else raw_action[0]
             elif isinstance(raw_action, torch.Tensor):
@@ -434,7 +445,6 @@ def play(model_path="grok_mamba.zip", state_path="mario_state.sav"):
             current_x, current_y = get_mario_position(base_env.pyboy)
             delta_x = current_x - prev_x
             
-            # Handle step return flexibly
             step_result = env.step([action])
             logger.debug(f"Step return values: {step_result}")
             if len(step_result) == 5:
@@ -446,7 +456,6 @@ def play(model_path="grok_mamba.zip", state_path="mario_state.sav"):
             else:
                 raise ValueError(f"Unexpected number of return values from env.step(): {len(step_result)}")
             
-            # Handle terminated and truncated as arrays or scalars
             terminated_flag = terminated[0] if isinstance(terminated, (list, np.ndarray)) else terminated
             truncated_flag = truncated[0] if isinstance(truncated, (list, np.ndarray)) else truncated
             
@@ -482,15 +491,16 @@ if __name__ == "__main__":
     parser.add_argument('--play', action='store_true', help="Play using the trained model instead of training")
     parser.add_argument('--resume', action='store_true', help="Resume training from saved model")
     parser.add_argument('--debug', action='store_true', help="Enable debug logging")
+    parser.add_argument('--cuda', action='store_true', help="Use CUDA if available")
     args = parser.parse_args()
 
     logger = setup_logging(debug=args.debug)
 
     try:
         if args.play:
-            play()
+            play(use_cuda=args.cuda)
         else:
-            train_rl_agent(render=args.render, resume=args.resume)
+            train_rl_agent(render=args.render, resume=args.resume, use_cuda=args.cuda)
     except KeyboardInterrupt:
         logger.info("KeyboardInterrupt caught in main! State should have been saved.")
         sys.exit(0)
