@@ -47,33 +47,22 @@ def press_start(pyboy):
     pyboy.send_input(WindowEvent.PRESS_BUTTON_START)
     for _ in range(60): pyboy.tick()
     pyboy.send_input(WindowEvent.RELEASE_BUTTON_START)
-def enable_turbo_mode(pyboy):
-    pyboy.send_input(WindowEvent.PRESS_SPEED_UP)
-    pyboy.tick()
-def disable_turbo_mode(pyboy):
-    pyboy.send_input(WindowEvent.RELEASE_SPEED_UP)
-    pyboy.tick()
 
 class MarioEnv(gym.Env):
-    def __init__(self, rom_path, render=False, state_path=None):
+    def __init__(self, rom_path, render=False):
         super(MarioEnv, self).__init__()
         self.rom_path = rom_path
         self.render_enabled = render
-        self.state_path = state_path
         self.pyboy = PyBoy(rom_path, window="SDL2" if render else "null", sound=False)
         self.action_space = gym.spaces.Discrete(8)
         self.observation_space = gym.spaces.Box(low=0, high=255, shape=(144, 160, 3), dtype=np.uint8)
         
-        if state_path and os.path.exists(state_path):
-            self.load_state(state_path)
-            self.initial_lives = get_lives(self.pyboy)  # Sync with loaded state
-        else:
-            press_start(self.pyboy)
-            for i in range(600):
-                self.pyboy.tick()
-                if i == 300: press_start(self.pyboy)
-                if get_lives(self.pyboy) > 0: break
-            self.initial_lives = get_lives(self.pyboy)
+        press_start(self.pyboy)
+        for i in range(600):
+            self.pyboy.tick()
+            if i == 300: press_start(self.pyboy)
+            if get_lives(self.pyboy) > 0: break
+        self.initial_lives = get_lives(self.pyboy)
 
         if self.render_enabled:
             logger.info("Initializing SDL2 window for rendering, sound disabled...")
@@ -87,35 +76,29 @@ class MarioEnv(gym.Env):
         self.steps = 0
         self.visited_x = set()
         self.total_reward = 0.0
-        self.stuck_counter = 0
-        self.last_x = self.prev_x
         self.last_action = None
-        self.state_saved_at_x81 = False
 
     def reset(self, seed=None, options=None):
-        if self.state_path and os.path.exists(self.state_path):
-            self.load_state(self.state_path)
-            self.initial_lives = get_lives(self.pyboy)  # Update on reset
+        self.pyboy.stop(save=False)
+        self.pyboy = PyBoy(self.rom_path, window="SDL2" if self.render_enabled else "null", sound=False)
+        press_start(self.pyboy)
+        for i in range(600):
+            self.pyboy.tick()
+            if i == 300: press_start(self.pyboy)
+            lives = get_lives(self.pyboy)
+            if lives > 0:
+                logger.info(f"Game started with {lives} lives at tick {i}")
+                self.initial_lives = lives
+                break
         else:
-            self.pyboy.stop(save=False)
-            self.pyboy = PyBoy(self.rom_path, window="SDL2" if self.render_enabled else "null", sound=False)
-            press_start(self.pyboy)
-            for i in range(600):
-                self.pyboy.tick()
-                if i == 300: press_start(self.pyboy)
-                lives = get_lives(self.pyboy)
-                if lives > 0:
-                    logger.info(f"Game started with {lives} lives at tick {i}")
-                    self.initial_lives = lives
-                    break
-            else:
-                logger.error("Failed to start game with lives > 0 after 600 ticks")
-                raise RuntimeError("Could not initialize game with lives")
-            if self.render_enabled:
-                logger.info("Re-initializing SDL2 window for rendering after reset...")
-                time.sleep(2)
+            logger.error("Failed to start game with lives > 0 after 600 ticks")
+            raise RuntimeError("Could not initialize game with lives")
         
-        for _ in range(60): self.pyboy.tick()  # Stabilize after load
+        if self.render_enabled:
+            logger.info("Re-initializing SDL2 window for rendering after reset...")
+            time.sleep(2)
+        
+        for _ in range(30): self.pyboy.tick()
         
         self.prev_coins = get_coins(self.pyboy)
         self.prev_x = get_mario_position(self.pyboy)[0]
@@ -125,10 +108,7 @@ class MarioEnv(gym.Env):
         self.steps = 0
         self.visited_x = {self.prev_x}
         self.total_reward = 0.0
-        self.stuck_counter = 0
-        self.last_x = self.prev_x
         self.last_action = None
-        self.state_saved_at_x81 = False
         observation = self._get_observation()
         info = {"steps": self.steps, "total_reward": self.total_reward}
         logger.info(f"Reset: Lives={self.prev_lives}, X={self.prev_x}, Y={self.prev_y}")
@@ -141,34 +121,35 @@ class MarioEnv(gym.Env):
             for _ in range(2): self.pyboy.tick()
         elif action == 1:  # Move right
             move_right(self.pyboy)
-            for _ in range(2): self.pyboy.tick()
+            for _ in range(4): self.pyboy.tick()
         elif action == 2:  # Long jump
             jump(self.pyboy)
-            for _ in range(24): self.pyboy.tick()
+            for _ in range(30): self.pyboy.tick()
             stop_jumping(self.pyboy)
         elif action == 3:  # Move right + long jump
             move_right(self.pyboy)
+            for _ in range(4): self.pyboy.tick()
             jump(self.pyboy)
-            for _ in range(24): self.pyboy.tick()
+            for _ in range(36): self.pyboy.tick()
             stop_jumping(self.pyboy)
         elif action == 4:  # Move left
             move_left(self.pyboy)
-            for _ in range(2): self.pyboy.tick()
+            for _ in range(4): self.pyboy.tick()
             stop_left(self.pyboy)
         elif action == 5:  # Short jump
             jump(self.pyboy)
-            for _ in range(10): self.pyboy.tick()
+            for _ in range(12): self.pyboy.tick()
             stop_jumping(self.pyboy)
         elif action == 6:  # Move left + long jump
             move_left(self.pyboy)
             jump(self.pyboy)
-            for _ in range(24): self.pyboy.tick()
+            for _ in range(30): self.pyboy.tick()
             stop_jumping(self.pyboy)
             stop_left(self.pyboy)
         elif action == 7:  # Move left + short jump
             move_left(self.pyboy)
             jump(self.pyboy)
-            for _ in range(10): self.pyboy.tick()
+            for _ in range(12): self.pyboy.tick()
             stop_jumping(self.pyboy)
             stop_left(self.pyboy)
         self.steps += 1
@@ -177,31 +158,20 @@ class MarioEnv(gym.Env):
         self.total_reward += reward
         terminated = self._is_done()
         current_x = get_mario_position(self.pyboy)[0]
-        if current_x == 81 and not self.state_saved_at_x81:
-            self.state_saved_at_x81 = True
-            logger.info("Reached x=81, not overwriting original state")
-        if current_x > 81 and self.prev_x <= 81:
-            self.save_state("mario_state_x81_progress.sav")
-            logger.info(f"Progress past x=81! Saved to mario_state_x81_progress.sav, X={current_x}")
-        if current_x == self.last_x and current_x >= 80:
-            self.stuck_counter += 1
-            if self.stuck_counter % 10 == 0:
-                logger.info(f"Stuck at x={current_x} for {self.stuck_counter} steps, last action={action}")
-        else:
-            self.stuck_counter = 0
-        self.last_x = current_x
+        current_y = get_mario_position(self.pyboy)[1]
+        
         self.last_action = action
-        truncated = self.stuck_counter > 100
-        info = {"steps": self.steps, "total_reward": self.total_reward, "stuck_counter": self.stuck_counter}
-        logger.debug(f"Step {self.steps}: X={current_x}, Action={action}, Reward={reward}, Total={self.total_reward}")
-        if terminated or truncated:
-            logger.info(f"Episode ended: action={action}, reward={reward}, total_reward={self.total_reward}, terminated={terminated}, truncated={truncated}, lives={get_lives(self.pyboy)}, x={self.prev_x}, y={self.prev_y}")
+        truncated = False
+        info = {"steps": self.steps, "total_reward": self.total_reward}
+        logger.debug(f"Step {self.steps}: X={current_x}, Y={current_y}, Action={action}, Reward={reward}, Total={self.total_reward}")
+        if terminated:
+            logger.info(f"Episode ended: action={action}, reward={reward}, total_reward={self.total_reward}, terminated={terminated}, truncated={truncated}, lives={get_lives(self.pyboy)}, x={current_x}, y={current_y}")
         if self.render_enabled:
             self.pyboy.tick()
             time.sleep(0.05)
         self.prev_coins = get_coins(self.pyboy)
-        self.prev_x = get_mario_position(self.pyboy)[0]
-        self.prev_y = get_mario_position(self.pyboy)[1]
+        self.prev_x = current_x
+        self.prev_y = current_y
         self.prev_lives = get_lives(self.pyboy)
         self.prev_world = get_world_level(self.pyboy)
         return observation, reward, terminated, truncated, info
@@ -216,24 +186,21 @@ class MarioEnv(gym.Env):
         current_coins = get_coins(self.pyboy)
         current_lives = get_lives(self.pyboy)
         current_world = get_world_level(self.pyboy)
-        progress_reward = (mario_x - self.prev_x) * 500 if mario_x > self.prev_x else 0
-        movement_penalty = -1.0 if mario_x <= self.prev_x else 0
-        coin_reward = (current_coins - self.prev_coins) * 10
-        death_penalty = -100 if current_lives < self.prev_lives else 0
-        survival_reward = 0.3
-        stage_complete = 200 if current_world > self.prev_world else 0
-        jump_reward = 2 if mario_y < self.prev_y and mario_x > self.prev_x else 0
-        exploration_bonus = 5.0 if mario_x not in self.visited_x else 0
-        stuck_penalty = -5.0 if mario_x >= 80 and mario_x <= 82 and self.stuck_counter > 5 else 0
-        x81_progress_bonus = 1000 if mario_x > 81 and self.prev_x == 81 and self.last_action in [1, 3] else 0
+        progress_reward = (mario_x - self.prev_x) * 1.0 if mario_x > self.prev_x else 0
+        movement_penalty = -0.01 if mario_x <= self.prev_x else 0
+        coin_reward = (current_coins - self.prev_coins) * 5.0
+        death_penalty = -15.0 if current_lives < self.prev_lives else 0
+        survival_reward = 0.1  # Increased from 0.05
+        stage_complete = 50.0 if current_world > self.prev_world else 0
+        jump_reward = 0.2 if mario_y < self.prev_y and mario_x > self.prev_x else 0  # Increased from 0.1
+        fall_penalty = -5.0 if mario_y > self.prev_y and mario_y > 150 else 0  # New: penalize falling off platforms
+        exploration_bonus = 0.5 if mario_x not in self.visited_x else 0
         self.visited_x.add(mario_x)
-        total_reward = (progress_reward + movement_penalty + coin_reward + survival_reward +
-                        death_penalty + stage_complete + jump_reward + exploration_bonus +
-                        stuck_penalty + x81_progress_bonus) / 100
+        total_reward = progress_reward + movement_penalty + coin_reward + survival_reward + death_penalty + stage_complete + jump_reward + fall_penalty + exploration_bonus
         return total_reward
 
     def _is_done(self):
-        return get_lives(self.pyboy) == 0  # End only when lives are 0
+        return get_lives(self.pyboy) == 0
 
     def render(self, mode='human'):
         if self.render_enabled and mode == 'human':
@@ -355,8 +322,8 @@ class AutosaveCallback(BaseCallback):
             self.model.save("grok_mamba_autosave")
             self.last_save = current_timesteps
 
-def train_rl_agent(render=False, resume=False, state_path=None):
-    base_env = MarioEnv('SuperMarioLand.gb', render=render, state_path=state_path)
+def train_rl_agent(render=False, resume=False):
+    base_env = MarioEnv('SuperMarioLand.gb', render=render)
     logger.info(f"Base observation space: {base_env.observation_space}")
     env = Monitor(base_env)
     env = DummyVecEnv([lambda: base_env])
@@ -374,8 +341,8 @@ def train_rl_agent(render=False, resume=False, state_path=None):
         gamma=0.99,
         gae_lambda=0.95,
         clip_range=0.2,
-        ent_coef=0.5,
-        vf_coef=1.0,
+        ent_coef=0.5,  # Reduced from 1.0 to lower exploration
+        vf_coef=0.5,   # Reduced from 1.0 to balance value loss
         device='cuda' if torch.cuda.is_available() else 'cpu'
     )
     
@@ -394,7 +361,7 @@ def train_rl_agent(render=False, resume=False, state_path=None):
         logger.info("State and model saved via try-except. Exiting...")
         sys.exit(0)
 
-    play_env = MarioEnv('SuperMarioLand.gb', render=True, state_path=state_path)
+    play_env = MarioEnv('SuperMarioLand.gb', render=True)
     play_env = Monitor(play_env)
     play_env = DummyVecEnv([lambda: play_env])
     play_env = VecTransposeImage(play_env)
@@ -413,7 +380,7 @@ def train_rl_agent(render=False, resume=False, state_path=None):
 
 def play(model_path="grok_mamba.zip", state_path="mario_state.sav"):
     try:
-        env = MarioEnv('SuperMarioLand.gb', render=True, state_path=state_path if os.path.exists(state_path) else None)
+        env = MarioEnv('SuperMarioLand.gb', render=True)
         env = Monitor(env)
         env = DummyVecEnv([lambda: env])
         env = VecTransposeImage(env)
@@ -441,7 +408,7 @@ def play(model_path="grok_mamba.zip", state_path="mario_state.sav"):
             current_x, current_y = get_mario_position(env.envs[0].pyboy)
             delta_x = current_x - prev_x
             obs, reward, terminated, truncated, info = env.step([action])
-            logger.info(f"Step {step}, X={current_x}, Y={current_y}, Action={action}, Reward={reward[0]}, Total Reward={total_reward + reward[0]}, Stuck={env.envs[0].stuck_counter}")
+            logger.info(f"Step {step}, X={current_x}, Y={current_y}, Action={action}, Reward={reward[0]}, Total Reward={total_reward + reward[0]}")
             total_reward += reward[0]
             env.render()
             prev_x = current_x
@@ -468,7 +435,6 @@ if __name__ == "__main__":
     parser.add_argument('--render', action='store_true', help="Enable game UI during training")
     parser.add_argument('--play', action='store_true', help="Play using the trained model instead of training")
     parser.add_argument('--resume', action='store_true', help="Resume training from saved model")
-    parser.add_argument('--state_path', type=str, default=None, help="Path to initial state file (e.g., mario_state_x80_stable.sav)")
     parser.add_argument('--debug', action='store_true', help="Enable debug logging")
     args = parser.parse_args()
 
@@ -476,9 +442,9 @@ if __name__ == "__main__":
 
     try:
         if args.play:
-            play(state_path=args.state_path)
+            play()
         else:
-            train_rl_agent(render=args.render, resume=args.resume, state_path=args.state_path)
+            train_rl_agent(render=args.render, resume=args.resume)
     except KeyboardInterrupt:
         logger.info("KeyboardInterrupt caught in main! State should have been saved.")
         sys.exit(0)
