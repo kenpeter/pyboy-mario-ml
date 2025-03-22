@@ -165,7 +165,7 @@ class MarioEnv(gym.Env):
         info = {"steps": self.steps, "total_reward": self.total_reward}
         logger.debug(f"Step {self.steps}: X={current_x}, Y={current_y}, Action={action}, Reward={reward}, Total={self.total_reward}")
         if terminated:
-            logger.info(f"Episode ended: action={action}, reward={reward}, total_reward={self.total_reward}, terminated={terminated}, truncated={truncated}, lives={get_lives(self.pyboy)}, x={current_x}, y={current_y}")
+            logger.info(f"Episode ended: action={action}, reward={reward}, total_reward={self.total_reward}, terminated={terminated}, truncated={truncated}, lives={get_lives(self.pyboy)}, x={self.prev_x}, y={self.prev_y}")
         if self.render_enabled:
             self.pyboy.tick()
             time.sleep(0.05)
@@ -190,13 +190,12 @@ class MarioEnv(gym.Env):
         movement_penalty = -0.01 if mario_x <= self.prev_x else 0
         coin_reward = (current_coins - self.prev_coins) * 5.0
         death_penalty = -15.0 if current_lives < self.prev_lives else 0
-        survival_reward = 0.1  # Increased from 0.05
+        survival_reward = 0.05
         stage_complete = 50.0 if current_world > self.prev_world else 0
-        jump_reward = 0.2 if mario_y < self.prev_y and mario_x > self.prev_x else 0  # Increased from 0.1
-        fall_penalty = -5.0 if mario_y > self.prev_y and mario_y > 150 else 0  # New: penalize falling off platforms
+        jump_reward = 0.1 if mario_y < self.prev_y and mario_x > self.prev_x else 0
         exploration_bonus = 0.5 if mario_x not in self.visited_x else 0
         self.visited_x.add(mario_x)
-        total_reward = progress_reward + movement_penalty + coin_reward + survival_reward + death_penalty + stage_complete + jump_reward + fall_penalty + exploration_bonus
+        total_reward = progress_reward + movement_penalty + coin_reward + survival_reward + death_penalty + stage_complete + jump_reward + exploration_bonus
         return total_reward
 
     def _is_done(self):
@@ -341,8 +340,8 @@ def train_rl_agent(render=False, resume=False):
         gamma=0.99,
         gae_lambda=0.95,
         clip_range=0.2,
-        ent_coef=0.5,  # Reduced from 1.0 to lower exploration
-        vf_coef=0.5,   # Reduced from 1.0 to balance value loss
+        ent_coef=1.0,
+        vf_coef=1.0,
         device='cuda' if torch.cuda.is_available() else 'cpu'
     )
     
