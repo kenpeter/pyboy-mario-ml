@@ -56,6 +56,7 @@ class MarioEnv(gym.Env):
         self.pyboy = PyBoy(rom_path, window="SDL2" if render else "null", sound=False)
         self.action_space = gym.spaces.Discrete(8)
         self.observation_space = gym.spaces.Box(low=0, high=255, shape=(144, 160, 3), dtype=np.uint8)
+        self.render_mode = "human" if render else None  # Specify render_mode
         
         press_start(self.pyboy)
         for i in range(600):
@@ -302,24 +303,28 @@ def signal_handler(sig, frame, env, model):
     sys.exit(0)
 
 class AutosaveCallback(BaseCallback):
-    def __init__(self, env, model, interval=8192, verbose=0):
+    def __init__(self, env, model, total_timesteps, initial_timesteps=0, interval=8192, verbose=0):
         super(AutosaveCallback, self).__init__(verbose)
         self.env = env
         self.model = model
+        self.total_timesteps = total_timesteps
+        self.initial_timesteps = initial_timesteps
         self.interval = interval
-        self.last_save = 0
+        self.last_save = initial_timesteps
 
     def _on_step(self):
         return True
 
     def _on_rollout_end(self):
-        current_timesteps = self.num_timesteps
-        logger.info(f"Callback: Current timesteps = {current_timesteps}")
-        if current_timesteps - self.last_save >= self.interval:
-            logger.info(f"Autosaving at timestep {current_timesteps}...")
+        current_session_timesteps = self.num_timesteps
+        total_timesteps_so_far = current_session_timesteps + self.initial_timesteps
+        percentage_complete = (total_timesteps_so_far / self.total_timesteps) * 100
+        logger.info(f"Callback: Total timesteps = {total_timesteps_so_far}/{self.total_timesteps}, Progress = {percentage_complete:.2f}%")
+        if total_timesteps_so_far - self.last_save >= self.interval:
+            logger.info(f"Autosaving at timestep {total_timesteps_so_far} ({percentage_complete:.2f}%)...")
             self.env.save_state("mario_state_autosave.sav")
             self.model.save("grok_mamba_autosave")
-            self.last_save = current_timesteps
+            self.last_save = total_timesteps_so_far
 
 def train_rl_agent(render=False, resume=False):
     base_env = MarioEnv('SuperMarioLand.gb', render=render)
@@ -329,32 +334,54 @@ def train_rl_agent(render=False, resume=False):
     env = VecTransposeImage(env)
     logger.info(f"Wrapped observation space: {env.observation_space}")
     model_path = "grok_mamba.zip"
-    model = PPO.load(model_path, env=env) if resume and os.path.exists(model_path) else PPO(
-        MambaPolicy,
-        env,
-        verbose=2,
-        learning_rate=0.0001,
-        n_steps=2048,
-        batch_size=128,
-        n_epochs=10,
-        gamma=0.99,
-        gae_lambda=0.95,
-        clip_range=0.2,
-        ent_coef=1.0,
-        vf_coef=1.0,
-        device='cuda' if torch.cuda.is_available() else 'cpu'
-    )
+    total_training_timesteps = 1_000_000
     
+    if resume and os.path.exists(model_path):
+        model = PPO.load(model_path, env=env)
+        initial_timesteps = model.num_timesteps
+        remaining_timesteps = total_training_timesteps - initial_timesteps
+        if remaining_timesteps <= 0:
+            logger.info(f"Model already trained for {initial_timesteps} timesteps, which meets or exceeds target {total_training_timesteps}")
+            return
+        logger.info(f"Resuming training from {initial_timesteps} timesteps, {remaining_timesteps} timesteps remaining")
+    else:
+        model = PPO(
+            MambaPolicy,
+            env,
+            verbose=2,
+            learning_rate=0.0001,
+            n_steps=2048,
+            batch_size=128,
+            n_epochs=10,
+            gamma=0.99,
+            gae_lambda=0.95,
+            clip_range=0.2,
+            ent_coef=1.0,
+            vf_coef=1.0,
+            device='cuda' if torch.cuda.is_available() else 'cpu'
+        )
+        initial_timesteps = 0
+        remaining_timesteps = total_training_timesteps
+
     signal.signal(signal.SIGINT, lambda sig, frame: signal_handler(sig, frame, base_env, model))
     logger.info("Signal handler registered for SIGINT")
 
-    logger.info("Starting training...")
+    logger.info(f"Starting training for {remaining_timesteps} additional timesteps (Total target: {total_training_timesteps})...")
     try:
-        model.learn(total_timesteps=1_000_000, callback=AutosaveCallback(base_env, model))
+        model.learn(
+            total_timesteps=remaining_timesteps,
+            callback=AutosaveCallback(base_env, model, total_training_timesteps, initial_timesteps),
+            progress_bar=False,
+            reset_num_timesteps=False
+        )
+        total_timesteps_so_far = model.num_timesteps
+        percentage_complete = (total_timesteps_so_far / total_training_timesteps) * 100
         model.save("grok_mamba")
-        logger.info(f"=== Training Complete. Saved 'grok_mamba.zip'. Total timesteps: {model.num_timesteps} ===")
+        logger.info(f"=== Training Complete. Saved 'grok_mamba.zip'. Total timesteps: {total_timesteps_so_far}, Progress: {percentage_complete:.2f}% ===")
     except KeyboardInterrupt:
-        logger.info("KeyboardInterrupt caught! Saving state...")
+        total_timesteps_so_far = model.num_timesteps
+        percentage_complete = (total_timesteps_so_far / total_training_timesteps) * 100
+        logger.info(f"KeyboardInterrupt caught! Saving state at {percentage_complete:.2f}% (Total timesteps: {total_timesteps_so_far}/{total_training_timesteps})...")
         base_env.save_state("mario_state.sav")
         model.save("grok_mamba")
         logger.info("State and model saved via try-except. Exiting...")
@@ -366,7 +393,7 @@ def train_rl_agent(render=False, resume=False):
     play_env = VecTransposeImage(play_env)
     obs = play_env.reset()
     total_reward = 0
-    for _ in range(5000):
+    for step in range(5000):
         action, _ = model.predict(obs)
         obs, reward, terminated, truncated, info = play_env.step([action])
         total_reward += reward[0]
@@ -379,21 +406,21 @@ def train_rl_agent(render=False, resume=False):
 
 def play(model_path="grok_mamba.zip", state_path="mario_state.sav"):
     try:
-        env = MarioEnv('SuperMarioLand.gb', render=True)
-        env = Monitor(env)
-        env = DummyVecEnv([lambda: env])
+        base_env = MarioEnv('SuperMarioLand.gb', render=True)
+        env = Monitor(base_env)
+        env = DummyVecEnv([lambda: base_env])
         env = VecTransposeImage(env)
         model = PPO.load(model_path)
         logger.info("Model loaded successfully!")
         logger.info(f"Loaded model policy class: {model.policy.__class__.__name__}")
         
-        signal.signal(signal.SIGINT, lambda sig, frame: signal_handler(sig, frame, env.envs[0], model))
+        signal.signal(signal.SIGINT, lambda sig, frame: signal_handler(sig, frame, base_env, model))
         logger.info("Signal handler registered for SIGINT in play")
 
         obs = env.reset()
         total_reward = 0
         action_counts = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0}
-        prev_x = get_mario_position(env.envs[0].pyboy)[0]
+        prev_x = get_mario_position(base_env.pyboy)[0]
         for step in range(5000):
             raw_action, _ = model.predict(obs, deterministic=False)
             if isinstance(raw_action, np.ndarray):
@@ -404,30 +431,50 @@ def play(model_path="grok_mamba.zip", state_path="mario_state.sav"):
                 raise ValueError(f"Unexpected action type: {type(raw_action)}")
             action_counts[action] += 1
             logger.info(f"Step {step}, Action predicted: {action}")
-            current_x, current_y = get_mario_position(env.envs[0].pyboy)
+            current_x, current_y = get_mario_position(base_env.pyboy)
             delta_x = current_x - prev_x
-            obs, reward, terminated, truncated, info = env.step([action])
+            
+            # Handle step return flexibly
+            step_result = env.step([action])
+            logger.debug(f"Step return values: {step_result}")
+            if len(step_result) == 5:
+                obs, reward, terminated, truncated, info = step_result
+            elif len(step_result) == 4:
+                obs, reward, done, info = step_result
+                terminated = done
+                truncated = False
+            else:
+                raise ValueError(f"Unexpected number of return values from env.step(): {len(step_result)}")
+            
+            # Handle terminated and truncated as arrays or scalars
+            terminated_flag = terminated[0] if isinstance(terminated, (list, np.ndarray)) else terminated
+            truncated_flag = truncated[0] if isinstance(truncated, (list, np.ndarray)) else truncated
+            
             logger.info(f"Step {step}, X={current_x}, Y={current_y}, Action={action}, Reward={reward[0]}, Total Reward={total_reward + reward[0]}")
             total_reward += reward[0]
             env.render()
             prev_x = current_x
             time.sleep(0.05)
-            if terminated[0] or truncated[0]:
+            if terminated_flag or truncated_flag:
                 logger.info(f"Episode ended at step {step}. Total Reward: {total_reward}, Steps: {info[0]['steps']}")
                 logger.info(f"Action distribution: {action_counts}")
                 obs = env.reset()
                 total_reward = 0
                 action_counts = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0}
-                prev_x = get_mario_position(env.envs[0].pyboy)[0]
+                prev_x = get_mario_position(base_env.pyboy)
         env.close()
     except KeyboardInterrupt:
         logger.info("KeyboardInterrupt caught in play! Saving state...")
-        env.envs[0].save_state("mario_state.sav")
+        base_env.save_state("mario_state.sav")
         model.save("grok_mamba")
         logger.info("State and model saved in play. Exiting...")
         sys.exit(0)
     except Exception as e:
         logger.error(f"Error during play: {e}")
+        base_env.close()
+        raise
+    finally:
+        base_env.close()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train or play Super Mario Land with RL")
