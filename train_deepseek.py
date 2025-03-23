@@ -3,101 +3,74 @@ from pyboy.utils import WindowEvent
 import time
 import numpy as np
 import gymnasium as gym
+try:
+    from gymnasium.wrappers.frame_stack import FrameStack
+except ImportError:
+    import logging
+    logging.error("FrameStack not found in gymnasium.wrappers.frame_stack. Please check gymnasium version.")
+    raise
+
 from stable_baselines3 import PPO
+from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.callbacks import BaseCallback
 import torch
 import torch.nn as nn
 from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from torch.distributions import Categorical
+import signal
+import sys
+import os
+import logging
+import argparse
 
-# Memory addresses for Super Mario Land
-MARIO_X_POS = 0xC202  # X-coordinate of Mario
-MARIO_Y_POS = 0xC201  # Y-coordinate of Mario
-LIVES = 0xDA15  # Number of lives remaining
-COINS = 0xFFFA  # Coin counter (BCD format)
-WORLD_LEVEL = 0xFFB4  # Current world and level (e.g., 0x11 = 1-1)
+def setup_logging(debug=False):
+    logging_level = logging.DEBUG if debug else logging.INFO
+    logging.basicConfig(level=logging_level, format='%(asctime)s - %(levelname)s - %(message)s')
+    logger = logging.getLogger(__name__)
+    logger.info(f"Logging level set to: {logging.getLevelName(logging_level)}")
+    return logger
 
-def get_mario_position(pyboy):
-    """Return Mario's current (x, y) position from memory."""
-    return pyboy.memory[MARIO_X_POS], pyboy.memory[MARIO_Y_POS]
+MARIO_X_POS = 0xC202
+MARIO_Y_POS = 0xC201
+LIVES = 0xDA15
+COINS = 0xFFFA
+WORLD_LEVEL = 0xFFB4
 
-def get_lives(pyboy):
-    """Return the number of lives remaining."""
-    return pyboy.memory[LIVES]
-
-def get_coins(pyboy):
-    """Return the current coin count."""
-    return pyboy.memory[COINS]
-
-def get_world_level(pyboy):
-    """Return the current world and level."""
-    return pyboy.memory[WORLD_LEVEL]
-
-def move_right(pyboy):
-    """Move Mario right."""
-    pyboy.send_input(WindowEvent.PRESS_ARROW_RIGHT)
-
+def get_mario_position(pyboy): return pyboy.memory[MARIO_X_POS], pyboy.memory[MARIO_Y_POS]
+def get_lives(pyboy): return pyboy.memory[LIVES]
+def get_coins(pyboy): return pyboy.memory[COINS]
+def get_world_level(pyboy): return pyboy.memory[WORLD_LEVEL]
+def move_right(pyboy): pyboy.send_input(WindowEvent.PRESS_ARROW_RIGHT)
 def stop_moving(pyboy):
-    """Stop Mario's right or left movement."""
     pyboy.send_input(WindowEvent.RELEASE_ARROW_RIGHT)
     pyboy.send_input(WindowEvent.RELEASE_ARROW_LEFT)
-
-def move_left(pyboy):
-    """Move Mario left."""
-    pyboy.send_input(WindowEvent.PRESS_ARROW_LEFT)
-
-def stop_left(pyboy):
-    """Stop Mario's left movement."""
-    pyboy.send_input(WindowEvent.RELEASE_ARROW_LEFT)
-
-def jump(pyboy):
-    """Make Mario jump."""
-    pyboy.send_input(WindowEvent.PRESS_BUTTON_A)
-
-def stop_jumping(pyboy):
-    """Stop Mario's jump."""
-    pyboy.send_input(WindowEvent.RELEASE_BUTTON_A)
-
+def move_left(pyboy): pyboy.send_input(WindowEvent.PRESS_ARROW_LEFT)
+def stop_left(pyboy): pyboy.send_input(WindowEvent.RELEASE_ARROW_LEFT)
+def jump(pyboy): pyboy.send_input(WindowEvent.PRESS_BUTTON_A)
+def stop_jumping(pyboy): pyboy.send_input(WindowEvent.RELEASE_BUTTON_A)
 def press_start(pyboy):
-    """Press and release the Start button to begin the game."""
     pyboy.send_input(WindowEvent.PRESS_BUTTON_START)
-    for _ in range(60):
-        pyboy.tick()
+    for _ in range(30): pyboy.tick()
     pyboy.send_input(WindowEvent.RELEASE_BUTTON_START)
-
-def enable_turbo_mode(pyboy):
-    """Enable turbo mode by pressing the space bar."""
-    pyboy.send_input(WindowEvent.PRESS_SPEED_UP)
-    pyboy.tick()  # Ensure the event is processed
-
-def disable_turbo_mode(pyboy):
-    """Disable turbo mode by releasing the space bar."""
-    pyboy.send_input(WindowEvent.RELEASE_SPEED_UP)
-    pyboy.tick()  # Ensure the event is processed
 
 class MarioEnv(gym.Env):
     def __init__(self, rom_path, render=False):
-        """Initialize the Mario environment with ROM path and render option."""
         super(MarioEnv, self).__init__()
         self.rom_path = rom_path
         self.render_enabled = render
-        self.pyboy = PyBoy(rom_path, window="SDL2" if render else "null")
-        self.action_space = gym.spaces.Discrete(7)  # 7 actions: idle, right, jump, right+jump, left, long jump, run+jump
+        self.pyboy = PyBoy(rom_path, window="SDL2" if render else "null", sound=False)
+        self.action_space = gym.spaces.Discrete(6)
         self.observation_space = gym.spaces.Box(low=0, high=255, shape=(144, 160, 3), dtype=np.uint8)
+        self.frame_skip = 4
         
-        # Initialize the game
         press_start(self.pyboy)
-        for i in range(600):
+        for i in range(300):
             self.pyboy.tick()
-            if i == 300:
-                press_start(self.pyboy)
-            if get_lives(self.pyboy) > 0:
-                break
-
-        # Delay turbo mode activation
-        if self.render_enabled:
-            time.sleep(5)  # Wait 5 seconds before enabling turbo mode
-            enable_turbo_mode(self.pyboy)
+            if i == 150: press_start(self.pyboy)
+            if get_lives(self.pyboy) > 0: break
+        self.initial_lives = get_lives(self.pyboy)
 
         self.prev_coins = get_coins(self.pyboy)
         self.prev_x = get_mario_position(self.pyboy)[0]
@@ -105,259 +78,291 @@ class MarioEnv(gym.Env):
         self.prev_lives = get_lives(self.pyboy)
         self.prev_world = get_world_level(self.pyboy)
         self.steps = 0
+        self.visited_x = set()
+        self.total_reward = 0.0
+        self.last_action = None
 
     def reset(self, seed=None, options=None):
-        """Reset the environment to the initial state."""
         self.pyboy.stop(save=False)
-        self.pyboy = PyBoy(self.rom_path, window="SDL2" if self.render_enabled else "null")
-        
-        # Initialize the game
+        self.pyboy = PyBoy(self.rom_path, window="SDL2" if self.render_enabled else "null", sound=False)
         press_start(self.pyboy)
-        for i in range(600):
+        for i in range(300):
             self.pyboy.tick()
-            if i == 300:
-                press_start(self.pyboy)
-            if get_lives(self.pyboy) > 0:
+            if i == 150: press_start(self.pyboy)
+            lives = get_lives(self.pyboy)
+            if lives > 0:
+                logger.info(f"Game started with {lives} lives at tick {i}")
+                self.initial_lives = lives
                 break
-
-        # Delay turbo mode activation
-        if self.render_enabled:
-            time.sleep(5)  # Wait 5 seconds before enabling turbo mode
-            enable_turbo_mode(self.pyboy)
-
+        else:
+            logger.error("Failed to start game with lives > 0 after 300 ticks")
+            raise RuntimeError("Could not initialize game with lives")
+        
+        for _ in range(15): self.pyboy.tick()
+        
         self.prev_coins = get_coins(self.pyboy)
         self.prev_x = get_mario_position(self.pyboy)[0]
         self.prev_y = get_mario_position(self.pyboy)[1]
         self.prev_lives = get_lives(self.pyboy)
         self.prev_world = get_world_level(self.pyboy)
         self.steps = 0
+        self.visited_x = {self.prev_x}
+        self.total_reward = 0.0
+        self.last_action = None
         observation = self._get_observation()
-        info = {"steps": self.steps}  # Additional info
-        return observation, info  # Gymnasium requires returning observation and info
+        info = {"steps": self.steps, "total_reward": self.total_reward}
+        logger.info(f"Reset: Lives={self.prev_lives}, X={self.prev_x}, Y={self.prev_y}")
+        return observation, info
 
     def step(self, action):
-        """Execute one step with the given action."""
         stop_moving(self.pyboy)
         stop_jumping(self.pyboy)
-
-        if action == 0:  # Idle
-            for _ in range(4):
+        reward = 0
+        for _ in range(self.frame_skip):
+            if action == 0:
                 self.pyboy.tick()
-        elif action == 1:  # Move right
-            move_right(self.pyboy)
-            for _ in range(4):
+            elif action == 1:
+                move_right(self.pyboy)
                 self.pyboy.tick()
-        elif action == 2:  # Jump
-            jump(self.pyboy)
-            for _ in range(20):
+            elif action == 2:
+                jump(self.pyboy)
                 self.pyboy.tick()
-            stop_jumping(self.pyboy)
-        elif action == 3:  # Move right and jump
-            move_right(self.pyboy)
-            jump(self.pyboy)
-            for _ in range(20):
+                stop_jumping(self.pyboy)
+            elif action == 3:
+                move_right(self.pyboy)
+                jump(self.pyboy)
                 self.pyboy.tick()
-            stop_jumping(self.pyboy)
-        elif action == 4:  # Move left
-            move_left(self.pyboy)
-            for _ in range(4):
+                stop_jumping(self.pyboy)
+            elif action == 4:
+                move_left(self.pyboy)
                 self.pyboy.tick()
-            stop_left(self.pyboy)
-        elif action == 5:  # Long jump
-            jump(self.pyboy)
-            for _ in range(40):  # Longer jump duration
+                stop_left(self.pyboy)
+            elif action == 5:
+                move_left(self.pyboy)
+                jump(self.pyboy)
                 self.pyboy.tick()
-            stop_jumping(self.pyboy)
-        elif action == 6:  # Run + jump
-            move_right(self.pyboy)
-            jump(self.pyboy)
-            for _ in range(40):  # Longer jump duration
-                self.pyboy.tick()
-            stop_jumping(self.pyboy)
-
+                stop_jumping(self.pyboy)
+                stop_left(self.pyboy)
+            reward += self._get_reward()
+            if self._is_done():
+                break
+        
         self.steps += 1
         observation = self._get_observation()
-        reward = self._get_reward()
-        terminated = self._is_done()  # Gymnasium uses "terminated" instead of "done"
-        truncated = False  # Gymnasium requires a "truncated" flag (e.g., for time limits)
-        info = {"steps": self.steps}  # Additional info
+        self.total_reward += reward
+        terminated = self._is_done()
+        current_x = get_mario_position(self.pyboy)[0]
+        current_y = get_mario_position(self.pyboy)[1]
+        
+        self.last_action = action
+        truncated = False
+        info = {"steps": self.steps, "total_reward": self.total_reward}
+        if terminated:
+            logger.info(f"Episode ended: action={action}, reward={reward}, total_reward={self.total_reward}, lives={get_lives(self.pyboy)}, x={self.prev_x}")
+        if self.render_enabled:
+            self.pyboy.tick()
         self.prev_coins = get_coins(self.pyboy)
-        self.prev_x = get_mario_position(self.pyboy)[0]
-        self.prev_y = get_mario_position(self.pyboy)[1]
+        self.prev_x = current_x
+        self.prev_y = current_y
         self.prev_lives = get_lives(self.pyboy)
         self.prev_world = get_world_level(self.pyboy)
-        return observation, reward, terminated, truncated, info  # Gymnasium requires 5 return values
+        return observation, reward, terminated, truncated, info
 
     def _get_observation(self):
-        """Get the current screen observation."""
-        screen_image = np.array(self.pyboy.screen.image)
+        screen_image = np.array(self.pyboy.screen.ndarray)
         return screen_image[:, :, :3] if screen_image.shape[-1] == 4 else screen_image
 
     def _get_reward(self):
-        """Calculate the reward based on current state with refined incentives."""
         mario_x, mario_y = get_mario_position(self.pyboy)
         current_coins = get_coins(self.pyboy)
         current_lives = get_lives(self.pyboy)
         current_world = get_world_level(self.pyboy)
-
-        # Stronger reward for progressing right
-        progress_reward = (mario_x - self.prev_x) * 100 if mario_x > self.prev_x else 0
-
-        # Penalty for moving left or stalling
-        movement_penalty = -10 if mario_x <= self.prev_x else 0
-
-        # Reward for collecting coins
-        coin_reward = (current_coins - self.prev_coins) * 100
-
-        # Penalty for losing a life
-        death_penalty = -200 if current_lives < self.prev_lives else 0
-
-        # Small survival bonus
-        survival_reward = 1.0
-
-        # Large reward for completing a stage
-        stage_complete = 2000 if current_world > self.prev_world else 0
-
-        # Reward for jumping (encourage avoiding obstacles or hitting blocks)
-        jump_reward = 100 if mario_y < self.prev_y else 0
-
-        # Time penalty to encourage faster progression
-        time_penalty = -0.5
-
-        # Total reward
-        total_reward = (
-            progress_reward +
-            movement_penalty +
-            coin_reward +
-            survival_reward +
-            death_penalty +
-            stage_complete +
-            jump_reward +
-            time_penalty
-        ) / 50  # Adjusted normalization factor for balance
-
-        return total_reward
+        progress_reward = (mario_x - self.prev_x) * 2.0 if mario_x > self.prev_x else 0
+        movement_penalty = -0.01 if mario_x <= self.prev_x else 0
+        coin_reward = (current_coins - self.prev_coins) * 5.0
+        death_penalty = -50.0 if current_lives < self.prev_lives else 0
+        survival_reward = 0.05
+        stage_complete = 50.0 if current_world > self.prev_world else 0
+        total_reward = progress_reward + movement_penalty + coin_reward + survival_reward + death_penalty + stage_complete
+        return np.clip(total_reward, -10.0, 10.0)
 
     def _is_done(self):
-        """Check if the episode is done."""
         return get_lives(self.pyboy) == 0
 
     def render(self, mode='human'):
-        """Render the game environment."""
         if self.render_enabled and mode == 'human':
             pass
         elif mode == 'rgb_array':
             return self._get_observation()
 
     def close(self):
-        """Clean up the environment."""
-        if self.render_enabled:
-            disable_turbo_mode(self.pyboy)
+        logger.debug("Closing MarioEnv...")
         self.pyboy.stop()
+        logger.debug("MarioEnv closed.")
 
-# Custom Transformer Feature Extractor
-class TransformerExtractor(BaseFeaturesExtractor):
+    def save_state(self, path):
+        try:
+            with open(path, 'wb') as f:
+                self.pyboy.save_state(f)
+            logger.info(f"Saved state to {path}")
+        except Exception as e:
+            logger.error(f"Failed to save state: {e}")
+
+    def load_state(self, path):
+        try:
+            with open(path, 'rb') as f:
+                self.pyboy.load_state(f)
+            logger.info(f"Loaded state from {path}")
+        except Exception as e:
+            logger.error(f"Failed to load state: {e}")
+
+class MambaExtractor(BaseFeaturesExtractor):
     def __init__(self, observation_space: gym.spaces.Box, feature_dim: int = 128):
-        """Initialize Transformer feature extractor."""
-        super(TransformerExtractor, self).__init__(observation_space, feature_dim)
-        # Adjust for VecTransposeImage [C, H, W] format
-        self.image_channels, self.image_height, self.image_width = observation_space.shape  # [C, H, W]
-        self.patch_size = 16  # Size of each patch
-        self.num_patches = (self.image_height // self.patch_size) * (self.image_width // self.patch_size)
-        self.flatten_dim = self.image_channels * self.patch_size * self.patch_size  # 3 * 16 * 16 = 768
-
+        super(MambaExtractor, self).__init__(observation_space, feature_dim)
+        self.stack_size, self.image_height, self.image_width, self.image_channels = observation_space.shape
+        self.patch_size = 32
+        self.num_patches_per_frame = (self.image_height // self.patch_size) * (self.image_width // self.patch_size)
+        self.flatten_dim = self.image_channels * self.patch_size * self.patch_size
         self.embedding = nn.Linear(self.flatten_dim, feature_dim)
-        self.transformer = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(d_model=feature_dim, nhead=4, dim_feedforward=128, dropout=0.1, batch_first=True),
-            num_layers=1
-        )
-        self.positional_encoding = nn.Parameter(torch.zeros(1, self.num_patches, feature_dim))
+        self.ssm_dim = feature_dim
+        self.A = nn.Parameter(torch.randn(feature_dim, feature_dim) * 0.01)
+        self.B = nn.Parameter(torch.randn(feature_dim, feature_dim) * 0.01)
+        self.C = nn.Linear(feature_dim, feature_dim)
 
     def forward(self, observations):
-        """Forward pass of the Transformer extractor."""
         batch_size = observations.shape[0]
-        # Handle transposed input from VecTransposeImage [B, C, H, W]
-        if observations.dim() == 4 and observations.shape[1] == 3:  # [B, C, H, W]
-            patches = observations.unfold(2, self.patch_size, self.patch_size).unfold(3, self.patch_size, self.patch_size)
-            patches = patches.contiguous().view(batch_size, -1, self.flatten_dim)  # [B, num_patches, flatten_dim]
-        else:
-            raise ValueError(f"Unexpected observation shape: {observations.shape}")
-        x = self.embedding(patches) + self.positional_encoding[:, :self.num_patches, :]
-        x = self.transformer(x)
-        return x.mean(dim=1)  # Global average pooling
+        if observations.dim() != 5:
+            raise ValueError(f"Unexpected shape: {observations.shape}, expected [B, {self.stack_size}, {self.image_height}, {self.image_width}, {self.image_channels}]")
+        
+        stack_size = observations.shape[1]
+        patches = observations.view(batch_size, stack_size, self.image_height, self.image_width, self.image_channels)
+        patches = patches.unfold(2, self.patch_size, self.patch_size).unfold(3, self.patch_size, self.patch_size)
+        patches = patches.contiguous().view(batch_size, stack_size * self.num_patches_per_frame, self.flatten_dim)
+        
+        x = self.embedding(patches)
+        seq_len = x.shape[1]
+        state = torch.zeros(batch_size, self.ssm_dim, device=x.device)
+        outputs = []
+        for t in range(min(seq_len, 20)):
+            state = torch.tanh(torch.matmul(state, self.A) + torch.matmul(x[:, t, :], self.B))
+            outputs.append(self.C(state))
+        x = torch.stack(outputs, dim=1).mean(dim=1)
+        return x
 
-# Custom Transformer Policy
-class TransformerPolicy(ActorCriticPolicy):
+class MambaPolicy(ActorCriticPolicy):
     def __init__(self, *args, **kwargs):
-        """Initialize Transformer-based policy."""
-        super(TransformerPolicy, self).__init__(*args, **kwargs, features_extractor_class=TransformerExtractor,
-                                               features_extractor_kwargs={'feature_dim': 128})
+        super(MambaPolicy, self).__init__(
+            *args,
+            **kwargs,
+            features_extractor_class=MambaExtractor,
+            features_extractor_kwargs={'feature_dim': 128}
+        )
+        self.actor = nn.Linear(128, self.action_space.n)
+        self.critic = nn.Linear(128, 1)
+        logger.debug(f"Initialized MambaPolicy: actor={self.actor}, critic={self.critic}")
 
-def train_rl_agent(headless=True):
-    """Train the RL agent with improved settings."""
-    env = MarioEnv('SuperMarioLand.gb', render=not headless)
-    model = PPO(
-        TransformerPolicy,
-        env,
-        verbose=1,
-        learning_rate=0.0001,
-        n_steps=2048,
-        batch_size=128,
-        n_epochs=10,
-        gamma=0.99,
-        gae_lambda=0.95,
-        clip_range=0.2,
-        ent_coef=0.3,
-    )
-    model.learn(total_timesteps=100_000)  # Train for 100,000 steps
-    model.save("deepseek")
-    print("=== Training Complete. Saved 'deepseek.zip' ===")
+    def forward(self, obs, deterministic=False):
+        features = self.extract_features(obs)
+        logger.debug(f"Features shape: {features.shape}")
+        
+        # Ensure features are on the correct device
+        if features.device != self.device:
+            features = features.to(self.device)
+        
+        logits = self.actor(features)
+        logger.debug(f"Logits shape: {logits.shape}, device: {logits.device}")
+        
+        values = self.critic(features)
+        logger.debug(f"Values shape: {values.shape}, device: {values.device}")
+        
+        # Ensure logits are valid for Categorical distribution
+        if logits.dim() != 2:
+            logger.error(f"Logits must have shape [batch_size, num_actions], but got {logits.shape}")
+            raise ValueError("Invalid logits shape for Categorical distribution")
+        
+        # Create the distribution
+        dist = Categorical(logits=logits)
+        logger.debug(f"Distribution created: {dist}, device: {logits.device}")
+        
+        # Extra check before calling mode/sample
+        if not isinstance(dist, Categorical):
+            logger.error(f"dist is not a Categorical object: {type(dist)}")
+            raise TypeError("Distribution is not a Categorical object")
+        
+        # Sample actions
+        actions = dist.mode() if deterministic else dist.sample()
+        logger.debug(f"Actions: {actions}, device: {actions.device}")
+        
+        log_probs = dist.log_prob(actions)
+        return actions, values, log_probs
 
-    env = MarioEnv('SuperMarioLand.gb', render=True)
-    obs, _ = env.reset()  # Gymnasium requires unpacking observation and info
-    total_reward = 0
-    for _ in range(5000):
-        action, _ = model.predict(obs)
-        obs, reward, terminated, truncated, info = env.step(action)
-        total_reward += reward
-        env.render()
-        if terminated or truncated:
-            print(f"Episode ended. Total Reward: {total_reward}, Steps: {info['steps']}")
-            obs, _ = env.reset()
-            total_reward = 0
-    env.close()
+    def predict(self, observation, state=None, episode_start=None, deterministic=False):
+        with torch.no_grad():
+            obs_tensor = torch.as_tensor(observation, device=self.device)
+            if obs_tensor.dim() == 4:  # Add batch dimension if missing
+                obs_tensor = obs_tensor.unsqueeze(0)
+            logger.debug(f"Observation tensor shape: {obs_tensor.shape}, device: {obs_tensor.device}")
+            logger.debug(f"Critic before predict: {self.critic}")
+            actions, values, _ = self.forward(obs_tensor, deterministic)
+            actions = actions.squeeze().cpu().numpy()  # Convert to numpy for Gym
+            return actions, None
 
-def play_trained_model(model_path="deepseek.zip"):
-    """Load and run the trained model to play Super Mario Land interactively."""
-    # Initialize environment with rendering enabled
-    env = MarioEnv('SuperMarioLand.gb', render=True)
-    
-    # Load the trained model
-    model = PPO.load(model_path, env=env)
-    
-    obs, _ = env.reset()
-    total_reward = 0
-    
-    try:
-        while True:  # Run until manually interrupted
-            action, _ = model.predict(obs)
-            obs, reward, terminated, truncated, info = env.step(action)
-            total_reward += reward
-            
-            if terminated or truncated:
-                print(f"Episode ended! Total Reward: {total_reward:.2f}, Steps: {info['steps']}")
-                obs, _ = env.reset()
-                total_reward = 0
-                
-    except KeyboardInterrupt:
-        print("\nPlay session interrupted by user.")
-    finally:
+should_exit = False
+
+def signal_handler(sig, frame, env, model):
+    global should_exit
+    logger.info("Ctrl+C detected! Saving state...")
+    if env:
+        base_env = env.envs[0].env
+        base_env.save_state("mario_state.sav")
+        logger.debug("Closing vectorized environment...")
         env.close()
+    if model:
+        logger.debug("Saving model...")
+        model.save("grok_mamba")
+    logger.info("State and model saved. Preparing to exit...")
+    should_exit = True
 
-# Update the main block to optionally run training or play mode
-if __name__ == "__main__":
-    # To train the agent:
-    train_rl_agent(headless=True)
+class AutosaveCallback(BaseCallback):
+    def __init__(self, env, model, total_timesteps, initial_timesteps=0, interval=16384, verbose=0):
+        super(AutosaveCallback, self).__init__(verbose)
+        self.env = env
+        self.model = model
+        self.total_timesteps = total_timesteps
+        self.initial_timesteps = initial_timesteps
+        self.interval = interval
+        self.last_save = initial_timesteps
+
+    def _on_step(self):
+        return not should_exit
+
+    def _on_rollout_end(self):
+        current_session_timesteps = self.num_timesteps
+        total_timesteps_so_far = current_session_timesteps + self.initial_timesteps
+        percentage_complete = (total_timesteps_so_far / self.total_timesteps) * 100
+        logger.info(f"Callback: Total timesteps = {total_timesteps_so_far}/{self.total_timesteps}, Progress = {percentage_complete:.2f}%")
+        if total_timesteps_so_far - self.last_save >= self.interval:
+            logger.info(f"Autosaving at timestep {total_timesteps_so_far} ({percentage_complete:.2f}%)...")
+            self.env.save_state("mario_state_autosave.sav")
+            self.model.save("grok_mamba_autosave")
+            self.last_save = total_timesteps_so_far
+
+def train_rl_agent(render=False, resume=False, use_cuda=False, model_path="grok_mamba.zip"):
+    global should_exit
+    should_exit = False
+
+    base_env = MarioEnv('SuperMarioLand.gb', render=render)
+    base_env = FrameStack(base_env, num_stack=4)
+    logger.info(f"Base observation space: {base_env.observation_space}")
+    env = Monitor(base_env)
+    env = DummyVecEnv([lambda: base_env])
+    logger.info(f"Wrapped observation space: {env.observation_space}")
+    total_training_timesteps = 1_000_000
     
-    # To play with the trained model:
-    #play_trained_model()
+    device = 'cuda' if use_cuda and torch.cuda.is_available() else 'cpu'
+    logger.info(f"Using device: {device}")
+    if use_cuda and not torch.cuda.is_available():
+        logger.warning("CUDA requested but not available, falling back to CPU")
+
+    if resume and os.path.exists(model_path):
+        model = PPO.load(model_path, env=

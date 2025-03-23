@@ -270,7 +270,6 @@ class MambaPolicy(ActorCriticPolicy):
         logger.debug(f"Values shape: {values.shape}")
         dist = Categorical(logits=logits)
         logger.debug(f"Distribution created: {dist}")
-        # Extra check before calling mode/sample
         if not isinstance(dist, Categorical):
             logger.error(f"dist is not a Categorical object: {type(dist)}")
             raise TypeError("Distribution is not a Categorical object")
@@ -294,9 +293,12 @@ should_exit = False
 
 def signal_handler(sig, frame, env, model):
     global should_exit
+    if should_exit:  # Prevent multiple calls
+        return
     logger.info("Ctrl+C detected! Saving state...")
+    signal.signal(signal.SIGINT, signal.SIG_IGN)  # Ignore further SIGINT signals
     if env:
-        base_env = env.envs[0].env
+        base_env = env.envs[0].env if isinstance(env, DummyVecEnv) else env
         base_env.save_state("mario_state.sav")
         logger.debug("Closing vectorized environment...")
         env.close()
@@ -305,6 +307,7 @@ def signal_handler(sig, frame, env, model):
         model.save("grok_mamba")
     logger.info("State and model saved. Preparing to exit...")
     should_exit = True
+    sys.exit(0)  # Force exit after saving
 
 class AutosaveCallback(BaseCallback):
     def __init__(self, env, model, total_timesteps, initial_timesteps=0, interval=16384, verbose=0):
@@ -340,7 +343,7 @@ def train_rl_agent(render=False, resume=False, use_cuda=False, model_path="grok_
     env = Monitor(base_env)
     env = DummyVecEnv([lambda: base_env])
     logger.info(f"Wrapped observation space: {env.observation_space}")
-    total_training_timesteps = 1_000_000
+    total_training_timesteps = 10000  # Reduced from your log
     
     device = 'cuda' if use_cuda and torch.cuda.is_available() else 'cpu'
     logger.info(f"Using device: {device}")
@@ -396,6 +399,7 @@ def train_rl_agent(render=False, resume=False, use_cuda=False, model_path="grok_
         model.save("grok_mamba")
         env.close()
         logger.info("State and model saved. Exiting cleanly...")
+        sys.exit(0)
     finally:
         logger.debug("Ensuring environment is closed in finally block...")
         env.close()
@@ -404,19 +408,22 @@ def train_rl_agent(render=False, resume=False, use_cuda=False, model_path="grok_
         play_env = MarioEnv('SuperMarioLand.gb', render=True)
         play_env = FrameStack(play_env, num_stack=4)
         play_env = Monitor(play_env)
-        play_env = DummyVecEnv([lambda: play_env])
-        obs = play_env.reset()
+        play_vec_env = DummyVecEnv([lambda: play_env])
+        obs = play_vec_env.reset()
         total_reward = 0
         for step in range(5000):
+            if should_exit:  # Check for exit condition
+                logger.info("Exiting play loop due to Ctrl+C...")
+                break
             action, _ = model.predict(obs)
-            obs, reward, terminated, truncated, info = play_env.step([action])
-            total_reward += reward[0]
-            play_env.render()
-            if terminated[0] or truncated[0]:
-                logger.info(f"Episode ended. Reward: {total_reward}, Steps: {info[0]['steps']}")
-                obs = play_env.reset()
+            obs, rewards, dones, infos = play_vec_env.step([action])
+            total_reward += rewards[0]
+            play_vec_env.render()
+            if dones[0]:
+                logger.info(f"Episode ended. Reward: {total_reward}, Steps: {infos[0]['steps']}")
+                obs = play_vec_env.reset()
                 total_reward = 0
-        play_env.close()
+        play_vec_env.close()
 
 def play(model_path="grok_mamba.zip", state_path="mario_state.sav", use_cuda=False):
     global should_exit
@@ -445,13 +452,14 @@ def play(model_path="grok_mamba.zip", state_path="mario_state.sav", use_cuda=Fal
         total_reward = 0
         for step in range(5000):
             if should_exit:
+                logger.info("Exiting play loop due to Ctrl+C...")
                 break
             action, _ = model.predict(obs, deterministic=True)
-            obs, reward, terminated, truncated, info = env.step([action])
-            total_reward += reward[0]
+            obs, rewards, dones, infos = env.step([action])
+            total_reward += rewards[0]
             env.render()
-            if terminated[0] or truncated[0]:
-                logger.info(f"Episode ended. Reward: {total_reward}, Steps: {info[0]['steps']}")
+            if dones[0]:
+                logger.info(f"Episode ended. Reward: {total_reward}, Steps: {infos[0]['steps']}")
                 obs = env.reset()
                 total_reward = 0
         env.close()
@@ -460,6 +468,7 @@ def play(model_path="grok_mamba.zip", state_path="mario_state.sav", use_cuda=Fal
         base_env.save_state("mario_state.sav")
         model.save("grok_mamba")
         logger.info("State and model saved. Exiting...")
+        sys.exit(0)
     except Exception as e:
         logger.error(f"Error in play: {e}")
         base_env.close()
@@ -486,3 +495,4 @@ if __name__ == "__main__":
             train_rl_agent(render=args.render, resume=args.resume, use_cuda=args.cuda, model_path=args.model_path)
     except KeyboardInterrupt:
         logger.info("Interrupted in main! State should be saved.")
+        sys.exit(0)
