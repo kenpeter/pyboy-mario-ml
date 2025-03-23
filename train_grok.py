@@ -268,13 +268,14 @@ class MambaPolicy(ActorCriticPolicy):
         logger.debug(f"Logits shape: {logits.shape}")
         values = self.critic(features)
         logger.debug(f"Values shape: {values.shape}")
-        try:
-            dist = Categorical(logits=logits)
-            logger.debug(f"Distribution created: {dist}")
-        except Exception as e:
-            logger.error(f"Failed to create Categorical distribution: {e}")
-            raise
+        dist = Categorical(logits=logits)
+        logger.debug(f"Distribution created: {dist}")
+        # Extra check before calling mode/sample
+        if not isinstance(dist, Categorical):
+            logger.error(f"dist is not a Categorical object: {type(dist)}")
+            raise TypeError("Distribution is not a Categorical object")
         actions = dist.mode() if deterministic else dist.sample()
+        logger.debug(f"Actions: {actions}")
         log_probs = dist.log_prob(actions)
         return actions, values, log_probs
 
