@@ -196,7 +196,9 @@ class MarioEnv(gym.Env):
             return self._get_observation()
 
     def close(self):
+        logger.debug("Closing MarioEnv...")
         self.pyboy.stop()
+        logger.debug("MarioEnv closed.")
 
     def save_state(self, path):
         try:
@@ -257,12 +259,21 @@ class MambaPolicy(ActorCriticPolicy):
         )
         self.actor = nn.Linear(128, self.action_space.n)
         self.critic = nn.Linear(128, 1)
+        logger.debug(f"Initialized MambaPolicy: actor={self.actor}, critic={self.critic}")
 
     def forward(self, obs, deterministic=False):
         features = self.extract_features(obs)
+        logger.debug(f"Features shape: {features.shape}")
         logits = self.actor(features)
+        logger.debug(f"Logits shape: {logits.shape}")
         values = self.critic(features)
-        dist = Categorical(logits=logits)
+        logger.debug(f"Values shape: {values.shape}")
+        try:
+            dist = Categorical(logits=logits)
+            logger.debug(f"Distribution created: {dist}")
+        except Exception as e:
+            logger.error(f"Failed to create Categorical distribution: {e}")
+            raise
         actions = dist.mode() if deterministic else dist.sample()
         log_probs = dist.log_prob(actions)
         return actions, values, log_probs
@@ -270,19 +281,29 @@ class MambaPolicy(ActorCriticPolicy):
     def predict(self, observation, state=None, episode_start=None, deterministic=False):
         with torch.no_grad():
             obs_tensor = torch.as_tensor(observation, device=self.device)
-            if obs_tensor.dim() == 4: obs_tensor = obs_tensor.unsqueeze(0)
+            if obs_tensor.dim() == 4:  # Add batch dimension if missing
+                obs_tensor = obs_tensor.unsqueeze(0)
+            logger.debug(f"Observation tensor shape: {obs_tensor.shape}, device: {obs_tensor.device}")
+            logger.debug(f"Critic before predict: {self.critic}")
             actions, values, _ = self.forward(obs_tensor, deterministic)
-            actions = actions.squeeze().cpu().numpy()
+            actions = actions.squeeze().cpu().numpy()  # Convert to numpy for Gym
             return actions, None
 
+should_exit = False
+
 def signal_handler(sig, frame, env, model):
+    global should_exit
     logger.info("Ctrl+C detected! Saving state...")
     if env:
-        env.save_state("mario_state.sav")
+        base_env = env.envs[0].env
+        base_env.save_state("mario_state.sav")
+        logger.debug("Closing vectorized environment...")
+        env.close()
     if model:
+        logger.debug("Saving model...")
         model.save("grok_mamba")
-    logger.info("State and model saved. Exiting...")
-    sys.exit(0)
+    logger.info("State and model saved. Preparing to exit...")
+    should_exit = True
 
 class AutosaveCallback(BaseCallback):
     def __init__(self, env, model, total_timesteps, initial_timesteps=0, interval=16384, verbose=0):
@@ -295,7 +316,7 @@ class AutosaveCallback(BaseCallback):
         self.last_save = initial_timesteps
 
     def _on_step(self):
-        return True
+        return not should_exit
 
     def _on_rollout_end(self):
         current_session_timesteps = self.num_timesteps
@@ -308,14 +329,16 @@ class AutosaveCallback(BaseCallback):
             self.model.save("grok_mamba_autosave")
             self.last_save = total_timesteps_so_far
 
-def train_rl_agent(render=False, resume=False, use_cuda=False):
+def train_rl_agent(render=False, resume=False, use_cuda=False, model_path="grok_mamba.zip"):
+    global should_exit
+    should_exit = False
+
     base_env = MarioEnv('SuperMarioLand.gb', render=render)
     base_env = FrameStack(base_env, num_stack=4)
     logger.info(f"Base observation space: {base_env.observation_space}")
     env = Monitor(base_env)
     env = DummyVecEnv([lambda: base_env])
     logger.info(f"Wrapped observation space: {env.observation_space}")
-    model_path = "grok_mamba.zip"
     total_training_timesteps = 1_000_000
     
     device = 'cuda' if use_cuda and torch.cuda.is_available() else 'cpu'
@@ -324,7 +347,8 @@ def train_rl_agent(render=False, resume=False, use_cuda=False):
         logger.warning("CUDA requested but not available, falling back to CPU")
 
     if resume and os.path.exists(model_path):
-        model = PPO.load(model_path, env=env, device=device)
+        model = PPO.load(model_path, env=env, device=device, custom_objects={"policy_class": MambaPolicy})
+        logger.debug(f"Loaded model policy: actor={model.policy.actor}, critic={model.policy.critic}")
         initial_timesteps = model.num_timesteps
         remaining_timesteps = total_training_timesteps - initial_timesteps
         logger.info(f"Resuming from {initial_timesteps} timesteps, {remaining_timesteps} remaining")
@@ -348,7 +372,7 @@ def train_rl_agent(render=False, resume=False, use_cuda=False):
         remaining_timesteps = total_training_timesteps
         logger.info("Starting fresh training")
 
-    signal.signal(signal.SIGINT, lambda sig, frame: signal_handler(sig, frame, base_env, model))
+    signal.signal(signal.SIGINT, lambda sig, frame: signal_handler(sig, frame, env, model))
     logger.info("Signal handler registered")
 
     logger.info(f"Starting training for {remaining_timesteps} timesteps (Total: {total_training_timesteps})...")
@@ -369,27 +393,34 @@ def train_rl_agent(render=False, resume=False, use_cuda=False):
         logger.info(f"Interrupted! Saving at {percentage_complete:.2f}% (Timesteps: {total_timesteps_so_far}/{total_training_timesteps})...")
         base_env.save_state("mario_state.sav")
         model.save("grok_mamba")
-        logger.info("State and model saved. Exiting...")
-        sys.exit(0)
+        env.close()
+        logger.info("State and model saved. Exiting cleanly...")
+    finally:
+        logger.debug("Ensuring environment is closed in finally block...")
+        env.close()
 
-    play_env = MarioEnv('SuperMarioLand.gb', render=True)
-    play_env = FrameStack(play_env, num_stack=4)
-    play_env = Monitor(play_env)
-    play_env = DummyVecEnv([lambda: play_env])
-    obs = play_env.reset()
-    total_reward = 0
-    for step in range(5000):
-        action, _ = model.predict(obs)
-        obs, reward, terminated, truncated, info = play_env.step([action])
-        total_reward += reward[0]
-        play_env.render()
-        if terminated[0] or truncated[0]:
-            logger.info(f"Episode ended. Reward: {total_reward}, Steps: {info[0]['steps']}")
-            obs = play_env.reset()
-            total_reward = 0
-    play_env.close()
+    if not should_exit:
+        play_env = MarioEnv('SuperMarioLand.gb', render=True)
+        play_env = FrameStack(play_env, num_stack=4)
+        play_env = Monitor(play_env)
+        play_env = DummyVecEnv([lambda: play_env])
+        obs = play_env.reset()
+        total_reward = 0
+        for step in range(5000):
+            action, _ = model.predict(obs)
+            obs, reward, terminated, truncated, info = play_env.step([action])
+            total_reward += reward[0]
+            play_env.render()
+            if terminated[0] or truncated[0]:
+                logger.info(f"Episode ended. Reward: {total_reward}, Steps: {info[0]['steps']}")
+                obs = play_env.reset()
+                total_reward = 0
+        play_env.close()
 
 def play(model_path="grok_mamba.zip", state_path="mario_state.sav", use_cuda=False):
+    global should_exit
+    should_exit = False
+
     try:
         base_env = MarioEnv('SuperMarioLand.gb', render=True)
         base_env = FrameStack(base_env, num_stack=4)
@@ -401,15 +432,19 @@ def play(model_path="grok_mamba.zip", state_path="mario_state.sav", use_cuda=Fal
         if use_cuda and not torch.cuda.is_available():
             logger.warning("CUDA requested but not available")
         
-        model = PPO.load(model_path, env=env, device=device)
+        logger.info(f"Loading model from {model_path}")
+        model = PPO.load(model_path, env=env, device=device, custom_objects={"policy_class": MambaPolicy})
+        logger.debug(f"Loaded model policy: actor={model.policy.actor}, critic={model.policy.critic}")
         logger.info("Model loaded!")
         
-        signal.signal(signal.SIGINT, lambda sig, frame: signal_handler(sig, frame, base_env, model))
+        signal.signal(signal.SIGINT, lambda sig, frame: signal_handler(sig, frame, env, model))
         logger.info("Signal handler registered")
 
         obs = env.reset()
         total_reward = 0
         for step in range(5000):
+            if should_exit:
+                break
             action, _ = model.predict(obs, deterministic=True)
             obs, reward, terminated, truncated, info = env.step([action])
             total_reward += reward[0]
@@ -424,7 +459,6 @@ def play(model_path="grok_mamba.zip", state_path="mario_state.sav", use_cuda=Fal
         base_env.save_state("mario_state.sav")
         model.save("grok_mamba")
         logger.info("State and model saved. Exiting...")
-        sys.exit(0)
     except Exception as e:
         logger.error(f"Error in play: {e}")
         base_env.close()
@@ -439,15 +473,15 @@ if __name__ == "__main__":
     parser.add_argument('--resume', action='store_true', help="Resume training")
     parser.add_argument('--debug', action='store_true', help="Enable debug logging")
     parser.add_argument('--cuda', action='store_true', help="Use CUDA")
+    parser.add_argument('--model_path', type=str, default="grok_mamba.zip", help="Path to the model file to load")
     args = parser.parse_args()
 
     logger = setup_logging(debug=args.debug)
 
     try:
         if args.play:
-            play(use_cuda=args.cuda)
+            play(model_path=args.model_path, use_cuda=args.cuda)
         else:
-            train_rl_agent(render=args.render, resume=args.resume, use_cuda=args.cuda)
+            train_rl_agent(render=args.render, resume=args.resume, use_cuda=args.cuda, model_path=args.model_path)
     except KeyboardInterrupt:
         logger.info("Interrupted in main! State should be saved.")
-        sys.exit(0)
