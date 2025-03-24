@@ -310,7 +310,7 @@ def signal_handler(sig, frame, env, model):
     sys.exit(0)  # Force exit after saving
 
 class AutosaveCallback(BaseCallback):
-    def __init__(self, env, model, total_timesteps, initial_timesteps=0, interval=16384, verbose=0):
+    def __init__(self, env, model, total_timesteps, initial_timesteps=0, interval=4096, verbose=0):  # Changed to 4096
         super(AutosaveCallback, self).__init__(verbose)
         self.env = env
         self.model = model
@@ -343,7 +343,7 @@ def train_rl_agent(render=False, resume=False, use_cuda=False, model_path="grok_
     env = Monitor(base_env)
     env = DummyVecEnv([lambda: base_env])
     logger.info(f"Wrapped observation space: {env.observation_space}")
-    total_training_timesteps = 10000  # Reduced from your log
+    total_training_timesteps = 1_000_000_000
     
     device = 'cuda' if use_cuda and torch.cuda.is_available() else 'cpu'
     logger.info(f"Using device: {device}")
