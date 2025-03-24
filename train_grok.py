@@ -24,6 +24,11 @@ import sys
 import os
 import logging
 import argparse
+import gc
+
+# Custom exception for immediate training termination
+class TrainingInterrupt(Exception):
+    pass
 
 def setup_logging(debug=False):
     logging_level = logging.DEBUG if debug else logging.INFO
@@ -64,6 +69,7 @@ class MarioEnv(gym.Env):
         self.action_space = gym.spaces.Discrete(6)
         self.observation_space = gym.spaces.Box(low=0, high=255, shape=(144, 160, 3), dtype=np.uint8)
         self.frame_skip = 4
+        self.closed = False
         
         press_start(self.pyboy)
         for i in range(300):
@@ -83,8 +89,10 @@ class MarioEnv(gym.Env):
         self.last_action = None
 
     def reset(self, seed=None, options=None):
-        self.pyboy.stop(save=False)
+        if not self.closed and hasattr(self, 'pyboy'):
+            self.pyboy.stop(save=False)
         self.pyboy = PyBoy(self.rom_path, window="SDL2" if self.render_enabled else "null", sound=False)
+        self.closed = False
         press_start(self.pyboy)
         for i in range(300):
             self.pyboy.tick()
@@ -115,6 +123,8 @@ class MarioEnv(gym.Env):
         return observation, info
 
     def step(self, action):
+        if self.closed:
+            raise RuntimeError("Environment is closed")
         stop_moving(self.pyboy)
         stop_jumping(self.pyboy)
         reward = 0
@@ -169,6 +179,8 @@ class MarioEnv(gym.Env):
         return observation, reward, terminated, truncated, info
 
     def _get_observation(self):
+        if self.closed:
+            raise RuntimeError("Cannot get observation from closed environment")
         screen_image = np.array(self.pyboy.screen.ndarray)
         return screen_image[:, :, :3] if screen_image.shape[-1] == 4 else screen_image
 
@@ -190,6 +202,8 @@ class MarioEnv(gym.Env):
         return get_lives(self.pyboy) == 0
 
     def render(self, mode='human'):
+        if self.closed:
+            raise RuntimeError("Cannot render closed environment")
         if self.render_enabled and mode == 'human':
             pass
         elif mode == 'rgb_array':
@@ -197,12 +211,16 @@ class MarioEnv(gym.Env):
 
     def close(self):
         logger.debug("Closing MarioEnv...")
-        if hasattr(self, 'pyboy') and self.pyboy is not None:
+        if not self.closed and hasattr(self, 'pyboy') and self.pyboy is not None:
             self.pyboy.stop(save=False)
             self.pyboy = None
+            self.closed = True
         logger.debug("MarioEnv closed.")
 
     def save_state(self, path):
+        if self.closed:
+            logger.warning("Cannot save state of closed environment")
+            return
         try:
             with open(path, 'wb') as f:
                 self.pyboy.save_state(f)
@@ -211,6 +229,9 @@ class MarioEnv(gym.Env):
             logger.error(f"Failed to save state: {e}")
 
     def load_state(self, path):
+        if self.closed:
+            logger.warning("Cannot load state into closed environment")
+            return
         try:
             with open(path, 'rb') as f:
                 self.pyboy.load_state(f)
@@ -222,18 +243,18 @@ class MambaExtractor(BaseFeaturesExtractor):
     def __init__(self, observation_space: gym.spaces.Box, feature_dim: int = 256):
         super(MambaExtractor, self).__init__(observation_space, feature_dim)
         self.stack_size, self.image_height, self.image_width, self.image_channels = observation_space.shape
-        input_dim = self.stack_size * self.image_height * self.image_width * self.image_channels  # 69120
+        input_dim = self.stack_size * self.image_height * self.image_width * self.image_channels
         self.flatten = nn.Flatten()
-        self.linear = nn.Linear(input_dim, feature_dim)  # 69120 to 256
+        self.linear = nn.Linear(input_dim, feature_dim)
         logger.debug(f"MambaExtractor initialized: input_dim={input_dim}, feature_dim={feature_dim}")
 
     def forward(self, observations):
         logger.debug(f"Input observations shape: {observations.shape}, dtype: {observations.dtype}")
-        x = observations.float() / 255.0  # Convert to float32 and normalize
+        x = observations.float() / 255.0
         logger.debug(f"After conversion shape: {x.shape}, dtype: {x.dtype}")
-        x = self.flatten(x)  # Shape: (batch_size, 69120)
+        x = self.flatten(x)
         logger.debug(f"Flattened shape: {x.shape}")
-        features = self.linear(x)  # Shape: (batch_size, 256)
+        features = self.linear(x)
         logger.debug(f"Output features shape: {features.shape}")
         return features
 
@@ -245,9 +266,9 @@ class MambaPolicy(ActorCriticPolicy):
             features_extractor_class=MambaExtractor,
             features_extractor_kwargs={'feature_dim': 256}
         )
-        self.mlp_extractor = None  # Disable default MLP
-        self.actor = nn.Linear(256, self.action_space.n)  # 256 to 6
-        self.critic = nn.Linear(256, 1)  # 256 to 1
+        self.mlp_extractor = None
+        self.actor = nn.Linear(256, self.action_space.n)
+        self.critic = nn.Linear(256, 1)
         logger.debug(f"Initialized MambaPolicy: actor={self.actor}, critic={self.critic}")
 
     def extract_features(self, obs):
@@ -275,15 +296,14 @@ class MambaPolicy(ActorCriticPolicy):
     def predict(self, observation, state=None, episode_start=None, deterministic=False):
         with torch.no_grad():
             obs_tensor = torch.as_tensor(observation, device=self.device)
-            if obs_tensor.dim() == 4:  # Add batch dimension if missing
+            if obs_tensor.dim() == 4:
                 obs_tensor = obs_tensor.unsqueeze(0)
             logger.debug(f"Observation tensor shape: {obs_tensor.shape}, device: {obs_tensor.device}")
             actions, _, _ = self.forward(obs_tensor, deterministic)
-            actions = actions.squeeze().cpu().numpy()  # Convert to numpy for Gym
+            actions = actions.squeeze().cpu().numpy()
             return actions, None
 
     def predict_values(self, obs):
-        """Override to use self.critic directly"""
         with torch.no_grad():
             features = self.extract_features(obs)
             values = self.critic(features)
@@ -311,22 +331,32 @@ should_exit = False
 
 def signal_handler(sig, frame, env, model):
     global should_exit
-    if should_exit:  # Prevent multiple calls
+    if should_exit:
+        logger.debug("Signal handler called again, ignoring...")
         return
+    should_exit = True
     logger.info("Ctrl+C detected! Saving state...")
     signal.signal(signal.SIGINT, signal.SIG_IGN)
-    if env:
-        base_env = env.envs[0].env if isinstance(env, DummyVecEnv) else env
-        base_env.save_state("mario_state.sav")
-        logger.debug("Closing vectorized environment...")
-        env.close()
-    if model:
-        logger.debug("Saving model...")
-        model.save("grok_mamba")
-    logger.info("State and model saved. Preparing to exit...")
-    should_exit = True
-    time.sleep(0.5)
-    sys.exit(0)
+    try:
+        if env:
+            monitor_env = env.envs[0]
+            frame_stack_env = monitor_env.env
+            mario_env = frame_stack_env.unwrapped
+            mario_env.save_state("mario_state.sav")
+            logger.debug("Closing vectorized environment...")
+            env.close()
+        if model:
+            logger.debug("Saving model...")
+            model.save("grok_mamba")
+        logger.info("State and model saved. Exiting gracefully...")
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()  # Clear CUDA memory
+        time.sleep(0.2)
+        raise TrainingInterrupt("Training interrupted by user")
+    except Exception as e:
+        logger.error(f"Error in signal handler: {e}")
+        raise
 
 class AutosaveCallback(BaseCallback):
     def __init__(self, env, model, total_timesteps, initial_timesteps=0, interval=4096, verbose=0):
@@ -339,16 +369,24 @@ class AutosaveCallback(BaseCallback):
         self.last_save = initial_timesteps
 
     def _on_step(self):
-        return not should_exit
+        if should_exit:
+            logger.debug("Stopping training loop due to should_exit")
+            return False
+        return True
 
     def _on_rollout_end(self):
+        if should_exit:
+            return
         current_session_timesteps = self.num_timesteps
         total_timesteps_so_far = current_session_timesteps + self.initial_timesteps
         percentage_complete = (total_timesteps_so_far / self.total_timesteps) * 100
         logger.info(f"Callback: Total timesteps = {total_timesteps_so_far}/{self.total_timesteps}, Progress = {percentage_complete:.2f}%")
         if total_timesteps_so_far - self.last_save >= self.interval:
             logger.info(f"Autosaving at timestep {total_timesteps_so_far} ({percentage_complete:.2f}%)...")
-            self.env.save_state("mario_state_autosave.sav")
+            monitor_env = self.env.envs[0]
+            frame_stack_env = monitor_env.env
+            mario_env = frame_stack_env.unwrapped
+            mario_env.save_state("mario_state_autosave.sav")
             self.model.save("grok_mamba_autosave")
             self.last_save = total_timesteps_so_far
 
@@ -360,7 +398,7 @@ def train_rl_agent(render=False, resume=False, use_cuda=False, model_path="grok_
     base_env = FrameStack(base_env, num_stack=4)
     logger.info(f"Base observation space: {base_env.observation_space}")
     env = Monitor(base_env)
-    env = DummyVecEnv([lambda: base_env])
+    env = DummyVecEnv([lambda: env])
     logger.info(f"Wrapped observation space: {env.observation_space}")
     total_training_timesteps = 1_000_000
     
@@ -402,7 +440,7 @@ def train_rl_agent(render=False, resume=False, use_cuda=False, model_path="grok_
     try:
         model.learn(
             total_timesteps=remaining_timesteps,
-            callback=AutosaveCallback(base_env, model, total_training_timesteps, initial_timesteps),
+            callback=AutosaveCallback(env, model, total_training_timesteps, initial_timesteps),
             progress_bar=True,
             reset_num_timesteps=False
         )
@@ -410,19 +448,23 @@ def train_rl_agent(render=False, resume=False, use_cuda=False, model_path="grok_
         percentage_complete = (total_timesteps_so_far / total_training_timesteps) * 100
         model.save("grok_mamba")
         logger.info(f"Training complete. Saved 'grok_mamba.zip'. Total timesteps: {total_timesteps_so_far}, Progress: {percentage_complete:.2f}%")
+    except TrainingInterrupt:
+        logger.info("Training interrupted by signal handler")
     except KeyboardInterrupt:
-        total_timesteps_so_far = model.num_timesteps
-        percentage_complete = (total_timesteps_so_far / total_training_timesteps) * 100
-        logger.info(f"Interrupted! Saving at {percentage_complete:.2f}% (Timesteps: {total_timesteps_so_far}/{total_training_timesteps})...")
-        base_env.save_state("mario_state.sav")
-        model.save("grok_mamba")
-        env.close()
-        logger.info("State and model saved. Exiting cleanly...")
-        sys.exit(0)
+        logger.info("KeyboardInterrupt caught in training, cleanup handled by signal handler")
+    except Exception as e:
+        logger.error(f"Unexpected error during training: {e}")
     finally:
         logger.debug("Ensuring environment is closed in finally block...")
-        if 'env' in locals():
+        if 'env' in locals() and not should_exit:
             env.close()
+        if should_exit:
+            logger.info("Program exiting due to interrupt...")
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            time.sleep(0.2)
+            sys.exit(0)
 
     if not should_exit:
         play_env = MarioEnv('SuperMarioLand.gb', render=True)
@@ -453,7 +495,7 @@ def play(model_path="grok_mamba.zip", state_path="mario_state.sav", use_cuda=Fal
         base_env = MarioEnv('SuperMarioLand.gb', render=True)
         base_env = FrameStack(base_env, num_stack=4)
         env = Monitor(base_env)
-        env = DummyVecEnv([lambda: base_env])
+        env = DummyVecEnv([lambda: env])
         
         device = 'cuda' if use_cuda and torch.cuda.is_available() else 'cpu'
         logger.info(f"Using device: {device}")
@@ -483,18 +525,25 @@ def play(model_path="grok_mamba.zip", state_path="mario_state.sav", use_cuda=Fal
                 obs = env.reset()
                 total_reward = 0
         env.close()
+    except TrainingInterrupt:
+        logger.info("Play interrupted by signal handler")
     except KeyboardInterrupt:
-        logger.info("Interrupted in play! Saving state...")
-        base_env.save_state("mario_state.sav")
-        model.save("grok_mamba")
-        logger.info("State and model saved. Exiting...")
-        sys.exit(0)
+        logger.info("KeyboardInterrupt caught in play, cleanup handled by signal handler")
     except Exception as e:
         logger.error(f"Error in play: {e}")
-        base_env.close()
+        if 'env' in locals():
+            env.close()
         raise
     finally:
-        base_env.close()
+        if 'env' in locals() and not should_exit:
+            env.close()
+        if should_exit:
+            logger.info("Program exiting due to interrupt...")
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            time.sleep(0.2)
+            sys.exit(0)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train or play Super Mario Land with RL")
@@ -513,6 +562,13 @@ if __name__ == "__main__":
             play(model_path=args.model_path, use_cuda=args.cuda)
         else:
             train_rl_agent(render=args.render, resume=args.resume, use_cuda=args.cuda, model_path=args.model_path)
+    except TrainingInterrupt:
+        logger.info("Main interrupted by signal handler")
     except KeyboardInterrupt:
-        logger.info("Interrupted in main! State should be saved.")
+        logger.info("Interrupted in main! Cleanup handled by signal handler")
+        if 'env' in locals():
+            env.close()
         sys.exit(0)
+    except Exception as e:
+        logger.error(f"Error in main: {e}")
+        sys.exit(1)
