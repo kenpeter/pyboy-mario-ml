@@ -197,7 +197,9 @@ class MarioEnv(gym.Env):
 
     def close(self):
         logger.debug("Closing MarioEnv...")
-        self.pyboy.stop()
+        if hasattr(self, 'pyboy') and self.pyboy is not None:
+            self.pyboy.stop(save=False)  # Ensure no save on close to avoid conflicts
+            self.pyboy = None  # Clear reference
         logger.debug("MarioEnv closed.")
 
     def save_state(self, path):
@@ -307,10 +309,11 @@ def signal_handler(sig, frame, env, model):
         model.save("grok_mamba")
     logger.info("State and model saved. Preparing to exit...")
     should_exit = True
+    time.sleep(0.5)  # Brief delay to allow cleanup
     sys.exit(0)  # Force exit after saving
 
 class AutosaveCallback(BaseCallback):
-    def __init__(self, env, model, total_timesteps, initial_timesteps=0, interval=4096, verbose=0):  # Changed to 4096
+    def __init__(self, env, model, total_timesteps, initial_timesteps=0, interval=4096, verbose=0):
         super(AutosaveCallback, self).__init__(verbose)
         self.env = env
         self.model = model
@@ -343,7 +346,7 @@ def train_rl_agent(render=False, resume=False, use_cuda=False, model_path="grok_
     env = Monitor(base_env)
     env = DummyVecEnv([lambda: base_env])
     logger.info(f"Wrapped observation space: {env.observation_space}")
-    total_training_timesteps = 1_000_000_000
+    total_training_timesteps = 1_000_000  # Adjusted to 1 million as recommended
     
     device = 'cuda' if use_cuda and torch.cuda.is_available() else 'cpu'
     logger.info(f"Using device: {device}")
@@ -402,7 +405,8 @@ def train_rl_agent(render=False, resume=False, use_cuda=False, model_path="grok_
         sys.exit(0)
     finally:
         logger.debug("Ensuring environment is closed in finally block...")
-        env.close()
+        if 'env' in locals():
+            env.close()
 
     if not should_exit:
         play_env = MarioEnv('SuperMarioLand.gb', render=True)
