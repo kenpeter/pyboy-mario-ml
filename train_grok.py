@@ -257,32 +257,18 @@ class MambaExtractor(BaseFeaturesExtractor):
         logger.debug(f"Output features shape: {features.shape}")
         return features
 
-class CustomMLPExtractor(nn.Module):
-    def __init__(self, feature_dim: int, action_dim: int):
-        super(CustomMLPExtractor, self).__init__()
-        self.actor = nn.Linear(feature_dim, action_dim)
-        self.critic = nn.Linear(feature_dim, 1)
-
-    def forward_actor(self, features):
-        return self.actor(features)
-
-    def forward_critic(self, features):
-        return self.critic(features)
-
 class MambaPolicy(ActorCriticPolicy):
     def __init__(self, *args, **kwargs):
         super(MambaPolicy, self).__init__(
             *args,
             **kwargs,
             features_extractor_class=MambaExtractor,
-            features_extractor_kwargs={'feature_dim': 256}
+            features_extractor_kwargs={'feature_dim': 256},
+            net_arch=dict(pi=[256], vf=[256])  # Minimal architecture for actor and critic
         )
-        # Override mlp_extractor with our custom version
-        self.mlp_extractor = CustomMLPExtractor(feature_dim=256, action_dim=self.action_space.n)
-        # Disable default actor_net and value_net since mlp_extractor handles them
-        self.actor_net = None
-        self.value_net = None
-        logger.debug(f"Initialized MambaPolicy with CustomMLPExtractor")
+        self.actor_net = nn.Linear(256, self.action_space.n)
+        self.value_net = nn.Linear(256, 1)
+        logger.debug(f"Initialized MambaPolicy: actor_net={self.actor_net}, value_net={self.value_net}")
 
     def _get_features(self, obs):
         features = self.features_extractor(obs)
@@ -296,7 +282,7 @@ class MambaPolicy(ActorCriticPolicy):
                 obs_tensor = obs_tensor.unsqueeze(0)
             logger.debug(f"Observation tensor shape: {obs_tensor.shape}, device: {obs_tensor.device}")
             features = self._get_features(obs_tensor)
-            logits = self.mlp_extractor.forward_actor(features)
+            logits = self.actor_net(features)
             logger.debug(f"Logits shape: {logits.shape}")
             distribution = Categorical(logits=logits)
             logger.debug(f"Distribution created: {distribution}")
@@ -310,8 +296,8 @@ class MambaPolicy(ActorCriticPolicy):
 
     def forward(self, obs, deterministic=False):
         features = self._get_features(obs)
-        logits = self.mlp_extractor.forward_actor(features)
-        values = self.mlp_extractor.forward_critic(features)
+        logits = self.actor_net(features)
+        values = self.value_net(features)
         distribution = Categorical(logits=logits)
         actions = distribution.mode() if deterministic else distribution.sample()
         log_probs = distribution.log_prob(actions)
@@ -319,8 +305,8 @@ class MambaPolicy(ActorCriticPolicy):
 
     def evaluate_actions(self, obs, actions):
         features = self._get_features(obs)
-        logits = self.mlp_extractor.forward_actor(features)
-        values = self.mlp_extractor.forward_critic(features)
+        logits = self.actor_net(features)
+        values = self.value_net(features)
         distribution = Categorical(logits=logits)
         log_prob = distribution.log_prob(actions)
         entropy = distribution.entropy()
@@ -408,7 +394,7 @@ def train_rl_agent(render=False, resume=False, use_cuda=False, model_path="grok_
 
     if resume and os.path.exists(model_path):
         model = PPO.load(model_path, env=env, device=device, custom_objects={"policy_class": MambaPolicy})
-        logger.debug(f"Loaded model policy: mlp_extractor={model.policy.mlp_extractor}")
+        logger.debug(f"Loaded model policy: actor_net={model.policy.actor_net}, value_net={model.policy.value_net}")
         initial_timesteps = model.num_timesteps
         remaining_timesteps = total_training_timesteps - initial_timesteps
         logger.info(f"Resuming from {initial_timesteps} timesteps, {remaining_timesteps} remaining")
@@ -508,7 +494,7 @@ def play(model_path="grok_mamba.zip", state_path="mario_state.sav", use_cuda=Fal
         
         logger.info(f"Loading model from {model_path}")
         model = PPO.load(model_path, env=env, device=device, custom_objects={"policy_class": MambaPolicy})
-        logger.debug(f"Loaded model policy: mlp_extractor={model.policy.mlp_extractor}")
+        logger.debug(f"Loaded model policy: actor_net={model.policy.actor_net}, value_net={model.policy.value_net}")
         logger.debug(f"Post-load self.forward type: {type(model.policy.forward)}")
         logger.info("Model loaded!")
         
