@@ -298,6 +298,10 @@ class MambaPolicy(ActorCriticPolicy):
             if obs_tensor.dim() == 4:
                 obs_tensor = obs_tensor.unsqueeze(0)
             logger.debug(f"Observation tensor shape: {obs_tensor.shape}, device: {obs_tensor.device}")
+            # Debug to ensure forward is callable
+            if not callable(self.forward):
+                logger.error(f"self.forward is not callable: {self.forward}")
+                raise TypeError("self.forward is not a callable method")
             actions, _, _ = self.forward(obs_tensor, deterministic)
             actions_np = actions.squeeze().cpu().numpy()
             if isinstance(actions_np, np.ndarray) and actions_np.size == 1:
@@ -512,6 +516,10 @@ def play(model_path="grok_mamba.zip", state_path="mario_state.sav", use_cuda=Fal
         logger.info(f"Loading model from {model_path}")
         model = PPO.load(model_path, env=env, device=device, custom_objects={"policy_class": MambaPolicy})
         logger.debug(f"Loaded model policy: actor={model.policy.actor}, critic={model.policy.critic}")
+        # Verify policy integrity after loading
+        if not callable(model.policy.forward):
+            logger.error(f"model.policy.forward is not callable: {model.policy.forward}")
+            raise TypeError("Loaded model's forward method is not callable")
         logger.info("Model loaded!")
         
         signal.signal(signal.SIGINT, lambda sig, frame: signal_handler(sig, frame, env, model))
