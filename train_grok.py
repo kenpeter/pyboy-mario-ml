@@ -257,6 +257,18 @@ class MambaExtractor(BaseFeaturesExtractor):
         logger.debug(f"Output features shape: {features.shape}")
         return features
 
+class CustomMLPExtractor(nn.Module):
+    def __init__(self, feature_dim: int, action_dim: int):
+        super(CustomMLPExtractor, self).__init__()
+        self.actor = nn.Linear(feature_dim, action_dim)
+        self.critic = nn.Linear(feature_dim, 1)
+
+    def forward_actor(self, features):
+        return self.actor(features)
+
+    def forward_critic(self, features):
+        return self.critic(features)
+
 class MambaPolicy(ActorCriticPolicy):
     def __init__(self, *args, **kwargs):
         super(MambaPolicy, self).__init__(
@@ -265,32 +277,17 @@ class MambaPolicy(ActorCriticPolicy):
             features_extractor_class=MambaExtractor,
             features_extractor_kwargs={'feature_dim': 256}
         )
-        self.mlp_extractor = None
-        self.actor = nn.Linear(256, self.action_space.n)
-        self.critic = nn.Linear(256, 1)
-        logger.debug(f"Initialized MambaPolicy: actor={self.actor}, critic={self.critic}")
+        # Override mlp_extractor with our custom version
+        self.mlp_extractor = CustomMLPExtractor(feature_dim=256, action_dim=self.action_space.n)
+        # Disable default actor_net and value_net since mlp_extractor handles them
+        self.actor_net = None
+        self.value_net = None
+        logger.debug(f"Initialized MambaPolicy with CustomMLPExtractor")
 
-    def extract_features(self, obs):
+    def _get_features(self, obs):
         features = self.features_extractor(obs)
         logger.debug(f"Extracted features shape: {features.shape}")
         return features
-
-    def forward(self, obs, deterministic=False):
-        features = self.extract_features(obs)
-        logger.debug(f"Features shape: {features.shape}")
-        logits = self.actor(features)
-        logger.debug(f"Logits shape: {logits.shape}")
-        values = self.critic(features)
-        logger.debug(f"Values shape: {values.shape}")
-        distribution = Categorical(logits=logits)
-        logger.debug(f"Distribution created: {distribution}")
-        if not isinstance(distribution, Categorical):
-            logger.error(f"distribution is not a Categorical object: {type(distribution)}")
-            raise TypeError("Distribution is not a Categorical object")
-        actions = distribution.mode() if deterministic else distribution.sample()
-        log_probs = distribution.log_prob(actions)
-        logger.debug(f"Actions: {actions}, Log probs: {log_probs}")
-        return actions, values, log_probs
 
     def predict(self, observation, state=None, episode_start=None, deterministic=False):
         with torch.no_grad():
@@ -298,36 +295,32 @@ class MambaPolicy(ActorCriticPolicy):
             if obs_tensor.dim() == 4:
                 obs_tensor = obs_tensor.unsqueeze(0)
             logger.debug(f"Observation tensor shape: {obs_tensor.shape}, device: {obs_tensor.device}")
-            # Debug to ensure forward is callable
-            if not callable(self.forward):
-                logger.error(f"self.forward is not callable: {self.forward}")
-                raise TypeError("self.forward is not a callable method")
-            actions, _, _ = self.forward(obs_tensor, deterministic)
+            features = self._get_features(obs_tensor)
+            logits = self.mlp_extractor.forward_actor(features)
+            logger.debug(f"Logits shape: {logits.shape}")
+            distribution = Categorical(logits=logits)
+            logger.debug(f"Distribution created: {distribution}")
+            actions = distribution.mode() if deterministic else distribution.sample()
+            logger.debug(f"Actions: {actions}")
             actions_np = actions.squeeze().cpu().numpy()
             if isinstance(actions_np, np.ndarray) and actions_np.size == 1:
                 actions_np = actions_np.item()
             logger.debug(f"Predicted actions: {actions_np}, type: {type(actions_np)}")
             return actions_np, None
 
-    def predict_values(self, obs):
-        with torch.no_grad():
-            features = self.extract_features(obs)
-            values = self.critic(features)
-            logger.debug(f"Predicted values shape: {values.shape}")
-            return values
-
-    def _get_action_dist_from_latent(self, latent_pi):
-        logger.debug(f"Latent_pi shape in _get_action_dist_from_latent: {latent_pi.shape}")
-        if latent_pi.shape[-1] != 256:
-            logger.error(f"Unexpected latent_pi shape: {latent_pi.shape}, expected last dim 256")
-            raise ValueError(f"Latent_pi has {latent_pi.shape[-1]} features, expected 256")
-        logits = self.actor(latent_pi)
-        return Categorical(logits=logits)
+    def forward(self, obs, deterministic=False):
+        features = self._get_features(obs)
+        logits = self.mlp_extractor.forward_actor(features)
+        values = self.mlp_extractor.forward_critic(features)
+        distribution = Categorical(logits=logits)
+        actions = distribution.mode() if deterministic else distribution.sample()
+        log_probs = distribution.log_prob(actions)
+        return actions, values, log_probs
 
     def evaluate_actions(self, obs, actions):
-        features = self.extract_features(obs)
-        logits = self.actor(features)
-        values = self.critic(features)
+        features = self._get_features(obs)
+        logits = self.mlp_extractor.forward_actor(features)
+        values = self.mlp_extractor.forward_critic(features)
         distribution = Categorical(logits=logits)
         log_prob = distribution.log_prob(actions)
         entropy = distribution.entropy()
@@ -406,7 +399,7 @@ def train_rl_agent(render=False, resume=False, use_cuda=False, model_path="grok_
     env = Monitor(base_env)
     env = DummyVecEnv([lambda: env])
     logger.info(f"Wrapped observation space: {env.observation_space}")
-    total_training_timesteps = 9000
+    total_training_timesteps = 1_000_000
     
     device = 'cuda' if use_cuda and torch.cuda.is_available() else 'cpu'
     logger.info(f"Using device: {device}")
@@ -415,7 +408,7 @@ def train_rl_agent(render=False, resume=False, use_cuda=False, model_path="grok_
 
     if resume and os.path.exists(model_path):
         model = PPO.load(model_path, env=env, device=device, custom_objects={"policy_class": MambaPolicy})
-        logger.debug(f"Loaded model policy: actor={model.policy.actor}, critic={model.policy.critic}")
+        logger.debug(f"Loaded model policy: mlp_extractor={model.policy.mlp_extractor}")
         initial_timesteps = model.num_timesteps
         remaining_timesteps = total_training_timesteps - initial_timesteps
         logger.info(f"Resuming from {initial_timesteps} timesteps, {remaining_timesteps} remaining")
@@ -515,11 +508,8 @@ def play(model_path="grok_mamba.zip", state_path="mario_state.sav", use_cuda=Fal
         
         logger.info(f"Loading model from {model_path}")
         model = PPO.load(model_path, env=env, device=device, custom_objects={"policy_class": MambaPolicy})
-        logger.debug(f"Loaded model policy: actor={model.policy.actor}, critic={model.policy.critic}")
-        # Verify policy integrity after loading
-        if not callable(model.policy.forward):
-            logger.error(f"model.policy.forward is not callable: {model.policy.forward}")
-            raise TypeError("Loaded model's forward method is not callable")
+        logger.debug(f"Loaded model policy: mlp_extractor={model.policy.mlp_extractor}")
+        logger.debug(f"Post-load self.forward type: {type(model.policy.forward)}")
         logger.info("Model loaded!")
         
         signal.signal(signal.SIGINT, lambda sig, frame: signal_handler(sig, frame, env, model))
