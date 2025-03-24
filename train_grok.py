@@ -198,8 +198,8 @@ class MarioEnv(gym.Env):
     def close(self):
         logger.debug("Closing MarioEnv...")
         if hasattr(self, 'pyboy') and self.pyboy is not None:
-            self.pyboy.stop(save=False)  # Ensure no save on close to avoid conflicts
-            self.pyboy = None  # Clear reference
+            self.pyboy.stop(save=False)
+            self.pyboy = None
         logger.debug("MarioEnv closed.")
 
     def save_state(self, path):
@@ -219,37 +219,23 @@ class MarioEnv(gym.Env):
             logger.error(f"Failed to load state: {e}")
 
 class MambaExtractor(BaseFeaturesExtractor):
-    def __init__(self, observation_space: gym.spaces.Box, feature_dim: int = 128):
+    def __init__(self, observation_space: gym.spaces.Box, feature_dim: int = 256):
         super(MambaExtractor, self).__init__(observation_space, feature_dim)
         self.stack_size, self.image_height, self.image_width, self.image_channels = observation_space.shape
-        self.patch_size = 32
-        self.num_patches_per_frame = (self.image_height // self.patch_size) * (self.image_width // self.patch_size)
-        self.flatten_dim = self.image_channels * self.patch_size * self.patch_size
-        self.embedding = nn.Linear(self.flatten_dim, feature_dim)
-        self.ssm_dim = feature_dim
-        self.A = nn.Parameter(torch.randn(feature_dim, feature_dim) * 0.01)
-        self.B = nn.Parameter(torch.randn(feature_dim, feature_dim) * 0.01)
-        self.C = nn.Linear(feature_dim, feature_dim)
+        input_dim = self.stack_size * self.image_height * self.image_width * self.image_channels  # 69120
+        self.flatten = nn.Flatten()
+        self.linear = nn.Linear(input_dim, feature_dim)  # 69120 to 256
+        logger.debug(f"MambaExtractor initialized: input_dim={input_dim}, feature_dim={feature_dim}")
 
     def forward(self, observations):
-        batch_size = observations.shape[0]
-        if observations.dim() != 5:
-            raise ValueError(f"Unexpected shape: {observations.shape}, expected [B, {self.stack_size}, {self.image_height}, {self.image_width}, {self.image_channels}]")
-        
-        stack_size = observations.shape[1]
-        patches = observations.view(batch_size, stack_size, self.image_height, self.image_width, self.image_channels)
-        patches = patches.unfold(2, self.patch_size, self.patch_size).unfold(3, self.patch_size, self.patch_size)
-        patches = patches.contiguous().view(batch_size, stack_size * self.num_patches_per_frame, self.flatten_dim)
-        
-        x = self.embedding(patches)
-        seq_len = x.shape[1]
-        state = torch.zeros(batch_size, self.ssm_dim, device=x.device)
-        outputs = []
-        for t in range(min(seq_len, 20)):
-            state = torch.tanh(torch.matmul(state, self.A) + torch.matmul(x[:, t, :], self.B))
-            outputs.append(self.C(state))
-        x = torch.stack(outputs, dim=1).mean(dim=1)
-        return x
+        logger.debug(f"Input observations shape: {observations.shape}, dtype: {observations.dtype}")
+        x = observations.float() / 255.0  # Convert to float32 and normalize
+        logger.debug(f"After conversion shape: {x.shape}, dtype: {x.dtype}")
+        x = self.flatten(x)  # Shape: (batch_size, 69120)
+        logger.debug(f"Flattened shape: {x.shape}")
+        features = self.linear(x)  # Shape: (batch_size, 256)
+        logger.debug(f"Output features shape: {features.shape}")
+        return features
 
 class MambaPolicy(ActorCriticPolicy):
     def __init__(self, *args, **kwargs):
@@ -257,11 +243,17 @@ class MambaPolicy(ActorCriticPolicy):
             *args,
             **kwargs,
             features_extractor_class=MambaExtractor,
-            features_extractor_kwargs={'feature_dim': 128}
+            features_extractor_kwargs={'feature_dim': 256}
         )
-        self.actor = nn.Linear(128, self.action_space.n)
-        self.critic = nn.Linear(128, 1)
+        self.mlp_extractor = None  # Disable default MLP
+        self.actor = nn.Linear(256, self.action_space.n)  # 256 to 6
+        self.critic = nn.Linear(256, 1)  # 256 to 1
         logger.debug(f"Initialized MambaPolicy: actor={self.actor}, critic={self.critic}")
+
+    def extract_features(self, obs):
+        features = self.features_extractor(obs)
+        logger.debug(f"Extracted features shape: {features.shape}")
+        return features
 
     def forward(self, obs, deterministic=False):
         features = self.extract_features(obs)
@@ -270,14 +262,14 @@ class MambaPolicy(ActorCriticPolicy):
         logger.debug(f"Logits shape: {logits.shape}")
         values = self.critic(features)
         logger.debug(f"Values shape: {values.shape}")
-        dist = Categorical(logits=logits)
-        logger.debug(f"Distribution created: {dist}")
-        if not isinstance(dist, Categorical):
-            logger.error(f"dist is not a Categorical object: {type(dist)}")
+        distribution = Categorical(logits=logits)
+        logger.debug(f"Distribution created: {distribution}")
+        if not isinstance(distribution, Categorical):
+            logger.error(f"distribution is not a Categorical object: {type(distribution)}")
             raise TypeError("Distribution is not a Categorical object")
-        actions = dist.mode() if deterministic else dist.sample()
+        actions = distribution.mode() if deterministic else distribution.sample()
         logger.debug(f"Actions: {actions}")
-        log_probs = dist.log_prob(actions)
+        log_probs = distribution.log_prob(actions)
         return actions, values, log_probs
 
     def predict(self, observation, state=None, episode_start=None, deterministic=False):
@@ -286,10 +278,34 @@ class MambaPolicy(ActorCriticPolicy):
             if obs_tensor.dim() == 4:  # Add batch dimension if missing
                 obs_tensor = obs_tensor.unsqueeze(0)
             logger.debug(f"Observation tensor shape: {obs_tensor.shape}, device: {obs_tensor.device}")
-            logger.debug(f"Critic before predict: {self.critic}")
-            actions, values, _ = self.forward(obs_tensor, deterministic)
+            actions, _, _ = self.forward(obs_tensor, deterministic)
             actions = actions.squeeze().cpu().numpy()  # Convert to numpy for Gym
             return actions, None
+
+    def predict_values(self, obs):
+        """Override to use self.critic directly"""
+        with torch.no_grad():
+            features = self.extract_features(obs)
+            values = self.critic(features)
+            logger.debug(f"Predicted values shape: {values.shape}")
+            return values
+
+    def _get_action_dist_from_latent(self, latent_pi):
+        logger.debug(f"Latent_pi shape in _get_action_dist_from_latent: {latent_pi.shape}")
+        if latent_pi.shape[-1] != 256:
+            logger.error(f"Unexpected latent_pi shape: {latent_pi.shape}, expected last dim 256")
+            raise ValueError(f"Latent_pi has {latent_pi.shape[-1]} features, expected 256")
+        logits = self.actor(latent_pi)
+        return Categorical(logits=logits)
+
+    def evaluate_actions(self, obs, actions):
+        features = self.extract_features(obs)
+        logits = self.actor(features)
+        values = self.critic(features)
+        distribution = Categorical(logits=logits)
+        log_prob = distribution.log_prob(actions)
+        entropy = distribution.entropy()
+        return values, log_prob, entropy
 
 should_exit = False
 
@@ -298,7 +314,7 @@ def signal_handler(sig, frame, env, model):
     if should_exit:  # Prevent multiple calls
         return
     logger.info("Ctrl+C detected! Saving state...")
-    signal.signal(signal.SIGINT, signal.SIG_IGN)  # Ignore further SIGINT signals
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
     if env:
         base_env = env.envs[0].env if isinstance(env, DummyVecEnv) else env
         base_env.save_state("mario_state.sav")
@@ -309,8 +325,8 @@ def signal_handler(sig, frame, env, model):
         model.save("grok_mamba")
     logger.info("State and model saved. Preparing to exit...")
     should_exit = True
-    time.sleep(0.5)  # Brief delay to allow cleanup
-    sys.exit(0)  # Force exit after saving
+    time.sleep(0.5)
+    sys.exit(0)
 
 class AutosaveCallback(BaseCallback):
     def __init__(self, env, model, total_timesteps, initial_timesteps=0, interval=4096, verbose=0):
@@ -346,7 +362,7 @@ def train_rl_agent(render=False, resume=False, use_cuda=False, model_path="grok_
     env = Monitor(base_env)
     env = DummyVecEnv([lambda: base_env])
     logger.info(f"Wrapped observation space: {env.observation_space}")
-    total_training_timesteps = 1_000_000  # Adjusted to 1 million as recommended
+    total_training_timesteps = 1_000_000
     
     device = 'cuda' if use_cuda and torch.cuda.is_available() else 'cpu'
     logger.info(f"Using device: {device}")
@@ -416,7 +432,7 @@ def train_rl_agent(render=False, resume=False, use_cuda=False, model_path="grok_
         obs = play_vec_env.reset()
         total_reward = 0
         for step in range(5000):
-            if should_exit:  # Check for exit condition
+            if should_exit:
                 logger.info("Exiting play loop due to Ctrl+C...")
                 break
             action, _ = model.predict(obs)
