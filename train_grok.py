@@ -264,7 +264,7 @@ class MambaPolicy(ActorCriticPolicy):
             **kwargs,
             features_extractor_class=MambaExtractor,
             features_extractor_kwargs={'feature_dim': 256},
-            net_arch=dict(pi=[256], vf=[256])  # Minimal architecture for actor and critic
+            net_arch=dict(pi=[256], vf=[256])
         )
         self.actor_net = nn.Linear(256, self.action_space.n)
         self.value_net = nn.Linear(256, 1)
@@ -274,25 +274,6 @@ class MambaPolicy(ActorCriticPolicy):
         features = self.features_extractor(obs)
         logger.debug(f"Extracted features shape: {features.shape}")
         return features
-
-    def predict(self, observation, state=None, episode_start=None, deterministic=False):
-        with torch.no_grad():
-            obs_tensor = torch.as_tensor(observation, device=self.device)
-            if obs_tensor.dim() == 4:
-                obs_tensor = obs_tensor.unsqueeze(0)
-            logger.debug(f"Observation tensor shape: {obs_tensor.shape}, device: {obs_tensor.device}")
-            features = self._get_features(obs_tensor)
-            logits = self.actor_net(features)
-            logger.debug(f"Logits shape: {logits.shape}")
-            distribution = Categorical(logits=logits)
-            logger.debug(f"Distribution created: {distribution}")
-            actions = distribution.mode() if deterministic else distribution.sample()
-            logger.debug(f"Actions: {actions}")
-            actions_np = actions.squeeze().cpu().numpy()
-            if isinstance(actions_np, np.ndarray) and actions_np.size == 1:
-                actions_np = actions_np.item()
-            logger.debug(f"Predicted actions: {actions_np}, type: {type(actions_np)}")
-            return actions_np, None
 
     def forward(self, obs, deterministic=False):
         features = self._get_features(obs)
