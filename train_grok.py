@@ -26,7 +26,6 @@ import logging
 import argparse
 import gc
 
-# Custom exception for immediate training termination
 class TrainingInterrupt(Exception):
     pass
 
@@ -289,8 +288,8 @@ class MambaPolicy(ActorCriticPolicy):
             logger.error(f"distribution is not a Categorical object: {type(distribution)}")
             raise TypeError("Distribution is not a Categorical object")
         actions = distribution.mode() if deterministic else distribution.sample()
-        logger.debug(f"Actions: {actions}")
         log_probs = distribution.log_prob(actions)
+        logger.debug(f"Actions: {actions}, Log probs: {log_probs}")
         return actions, values, log_probs
 
     def predict(self, observation, state=None, episode_start=None, deterministic=False):
@@ -300,8 +299,11 @@ class MambaPolicy(ActorCriticPolicy):
                 obs_tensor = obs_tensor.unsqueeze(0)
             logger.debug(f"Observation tensor shape: {obs_tensor.shape}, device: {obs_tensor.device}")
             actions, _, _ = self.forward(obs_tensor, deterministic)
-            actions = actions.squeeze().cpu().numpy()
-            return actions, None
+            actions_np = actions.squeeze().cpu().numpy()
+            if isinstance(actions_np, np.ndarray) and actions_np.size == 1:
+                actions_np = actions_np.item()
+            logger.debug(f"Predicted actions: {actions_np}, type: {type(actions_np)}")
+            return actions_np, None
 
     def predict_values(self, obs):
         with torch.no_grad():
@@ -351,7 +353,7 @@ def signal_handler(sig, frame, env, model):
         logger.info("State and model saved. Exiting gracefully...")
         gc.collect()
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()  # Clear CUDA memory
+            torch.cuda.empty_cache()
         time.sleep(0.2)
         raise TrainingInterrupt("Training interrupted by user")
     except Exception as e:
@@ -400,7 +402,7 @@ def train_rl_agent(render=False, resume=False, use_cuda=False, model_path="grok_
     env = Monitor(base_env)
     env = DummyVecEnv([lambda: env])
     logger.info(f"Wrapped observation space: {env.observation_space}")
-    total_training_timesteps = 1_000_000
+    total_training_timesteps = 9000
     
     device = 'cuda' if use_cuda and torch.cuda.is_available() else 'cpu'
     logger.info(f"Using device: {device}")
@@ -454,19 +456,23 @@ def train_rl_agent(render=False, resume=False, use_cuda=False, model_path="grok_
         logger.info("KeyboardInterrupt caught in training, cleanup handled by signal handler")
     except Exception as e:
         logger.error(f"Unexpected error during training: {e}")
+        raise
     finally:
         logger.debug("Ensuring environment is closed in finally block...")
-        if 'env' in locals() and not should_exit:
-            env.close()
-        if should_exit:
-            logger.info("Program exiting due to interrupt...")
-            gc.collect()
-            if torch.cuda.is_available():
+        if 'env' in locals():
+            try:
+                env.close()
+            except Exception as e:
+                logger.error(f"Error closing environment: {e}")
+        if torch.cuda.is_available():
+            try:
                 torch.cuda.empty_cache()
-            time.sleep(0.2)
-            sys.exit(0)
+            except Exception as e:
+                logger.error(f"Error clearing CUDA cache: {e}")
+        gc.collect()
+        time.sleep(0.2)
 
-    if not should_exit:
+    if not should_exit and render:
         play_env = MarioEnv('SuperMarioLand.gb', render=True)
         play_env = FrameStack(play_env, num_stack=4)
         play_env = Monitor(play_env)
@@ -478,6 +484,7 @@ def train_rl_agent(render=False, resume=False, use_cuda=False, model_path="grok_
                 logger.info("Exiting play loop due to Ctrl+C...")
                 break
             action, _ = model.predict(obs)
+            logger.debug(f"Post-training action: {action}, type: {type(action)}")
             obs, rewards, dones, infos = play_vec_env.step([action])
             total_reward += rewards[0]
             play_vec_env.render()
@@ -517,6 +524,7 @@ def play(model_path="grok_mamba.zip", state_path="mario_state.sav", use_cuda=Fal
                 logger.info("Exiting play loop due to Ctrl+C...")
                 break
             action, _ = model.predict(obs, deterministic=True)
+            logger.debug(f"Play action: {action}, type: {type(action)}")
             obs, rewards, dones, infos = env.step([action])
             total_reward += rewards[0]
             env.render()
@@ -531,19 +539,20 @@ def play(model_path="grok_mamba.zip", state_path="mario_state.sav", use_cuda=Fal
         logger.info("KeyboardInterrupt caught in play, cleanup handled by signal handler")
     except Exception as e:
         logger.error(f"Error in play: {e}")
-        if 'env' in locals():
-            env.close()
         raise
     finally:
-        if 'env' in locals() and not should_exit:
-            env.close()
-        if should_exit:
-            logger.info("Program exiting due to interrupt...")
-            gc.collect()
-            if torch.cuda.is_available():
+        if 'env' in locals():
+            try:
+                env.close()
+            except Exception as e:
+                logger.error(f"Error closing environment: {e}")
+        if torch.cuda.is_available():
+            try:
                 torch.cuda.empty_cache()
-            time.sleep(0.2)
-            sys.exit(0)
+            except Exception as e:
+                logger.error(f"Error clearing CUDA cache: {e}")
+        gc.collect()
+        time.sleep(0.2)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train or play Super Mario Land with RL")
@@ -566,8 +575,6 @@ if __name__ == "__main__":
         logger.info("Main interrupted by signal handler")
     except KeyboardInterrupt:
         logger.info("Interrupted in main! Cleanup handled by signal handler")
-        if 'env' in locals():
-            env.close()
         sys.exit(0)
     except Exception as e:
         logger.error(f"Error in main: {e}")
