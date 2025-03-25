@@ -188,11 +188,11 @@ class MarioEnv(gym.Env):
         current_coins = get_coins(self.pyboy)
         current_lives = get_lives(self.pyboy)
         current_world = get_world_level(self.pyboy)
-        progress_reward = (mario_x - self.prev_x) * 2.0 if mario_x > self.prev_x else 0
-        movement_penalty = -0.01 if mario_x <= self.prev_x else 0
+        progress_reward = (mario_x - self.prev_x) * 5.0 if mario_x > self.prev_x else 0  # Increased from 2.0 to 5.0
+        movement_penalty = -0.1 if mario_x <= self.prev_x else 0  # Increased from -0.01 to -0.1
         coin_reward = (current_coins - self.prev_coins) * 5.0
         death_penalty = -50.0 if current_lives < self.prev_lives else 0
-        survival_reward = 0.05
+        survival_reward = 0.01  # Reduced from 0.05 to 0.01
         stage_complete = 50.0 if current_world > self.prev_world else 0
         total_reward = progress_reward + movement_penalty + coin_reward + survival_reward + death_penalty + stage_complete
         return np.clip(total_reward, -10.0, 10.0)
@@ -366,7 +366,7 @@ def train_rl_agent(render=False, resume=False, use_cuda=False, model_path="grok_
     env = Monitor(base_env)
     env = DummyVecEnv([lambda: env])
     logger.info(f"Wrapped observation space: {env.observation_space}")
-    total_training_timesteps = 1_000_000
+    total_training_timesteps = 30_000
     
     device = 'cuda' if use_cuda and torch.cuda.is_available() else 'cpu'
     logger.info(f"Using device: {device}")
@@ -391,7 +391,7 @@ def train_rl_agent(render=False, resume=False, use_cuda=False, model_path="grok_
             gamma=0.99,
             gae_lambda=0.95,
             clip_range=0.2,
-            ent_coef=2.0,
+            ent_coef=5.0,  # Increased from 2.0 to 5.0 for more exploration
             vf_coef=0.5,
             device=device
         )
