@@ -145,7 +145,7 @@ class MarioEnv(gym.Env):
         return observation, reward, terminated, False, info
 
     def _get_observation(self):
-        screen = np.array(self.pyboy.screen.ndarray)[..., :3]  # [144, 160, 3]
+        screen = np.array(self.pyboy.screen.ndarray)[..., :3]
         return screen
 
     def _get_reward(self, action, mario_x, mario_y):
@@ -176,6 +176,17 @@ class MarioEnv(gym.Env):
             with open(path, 'wb') as f:
                 self.pyboy.save_state(f)
             logger.info(f"Saved state to {path}")
+
+    def load_state(self, path):
+        if os.path.exists(path) and not self.closed:
+            with open(path, 'rb') as f:
+                self.pyboy.load_state(f)
+            logger.info(f"Loaded state from {path}")
+            self.prev_x = get_mario_position(self.pyboy)[0]
+            self.prev_y = get_mario_position(self.pyboy)[1]
+            self.prev_lives = get_lives(self.pyboy)
+            return True
+        return False
 
 class CNNExtractor(BaseFeaturesExtractor):
     def __init__(self, observation_space: gym.spaces.Box, features_dim: int = 256):
@@ -224,7 +235,7 @@ def signal_handler(sig, frame, env, model, model_path):
         logger.error(f"Error during save: {e}")
         sys.exit(1)
 
-def train(render=False, model_path="mario_ppo.zip", use_cuda=False):
+def train(render=False, model_path="mario_ppo.zip", use_cuda=False, resume=False):
     global logger, should_exit
     base_env = MarioEnv('SuperMarioLand.gb', render=render)
     base_env = GrayScaleObservation(base_env, keep_dim=False)
@@ -236,22 +247,34 @@ def train(render=False, model_path="mario_ppo.zip", use_cuda=False):
     device = 'cuda' if use_cuda and torch.cuda.is_available() else 'cpu'
     logger.info(f"Using device: {device}")
     
-    model = PPO(
-        "CnnPolicy",
-        env,
-        policy_kwargs={"features_extractor_class": CNNExtractor, "features_extractor_kwargs": {"features_dim": 256}},
-        learning_rate=0.0001,
-        n_steps=2048,
-        batch_size=256,
-        n_epochs=5,
-        ent_coef=0.1,
-        device=device
-    )
-    
+    total_timesteps = 500_000
+    completed_timesteps = 0
+
+    if resume and os.path.exists(model_path):
+        model = PPO.load(model_path, env=env, device=device)
+        logger.info(f"Resumed model from {model_path}")
+        if base_env.unwrapped.load_state("mario_state.sav"):
+            completed_timesteps = model.num_timesteps  # Approximate from model
+            logger.info(f"Resuming from {completed_timesteps} timesteps")
+    else:
+        model = PPO(
+            "CnnPolicy",
+            env,
+            policy_kwargs={"features_extractor_class": CNNExtractor, "features_extractor_kwargs": {"features_dim": 256}},
+            learning_rate=2.5e-4,
+            n_steps=2048,
+            batch_size=256,
+            n_epochs=5,
+            ent_coef=0.1,
+            device=device
+        )
+        logger.info("Starting fresh training")
+
     signal.signal(signal.SIGINT, lambda sig, frame: signal_handler(sig, frame, env, model, model_path))
     logger.info("Starting training with progress bar...")
     try:
-        model.learn(total_timesteps=100_000, progress_bar=True)
+        remaining_timesteps = total_timesteps - completed_timesteps
+        model.learn(total_timesteps=remaining_timesteps, progress_bar=True, reset_num_timesteps=False)
         model.save(model_path)
         logger.info(f"Training complete. Saved model to {model_path}")
     except KeyboardInterrupt:
@@ -296,6 +319,7 @@ if __name__ == "__main__":
     parser.add_argument('--debug', action='store_true', help="Enable debug logging")
     parser.add_argument('--play', action='store_true', help="Play mode instead of training")
     parser.add_argument('--cuda', action='store_true', help="Use CUDA if available")
+    parser.add_argument('--resume', action='store_true', help="Resume training from saved model and state")
     args = parser.parse_args()
 
     logger = setup_logging(args.debug)
@@ -303,4 +327,4 @@ if __name__ == "__main__":
     if args.play:
         play(model_path=args.model_path, use_cuda=args.cuda)
     else:
-        train(render=args.render, model_path=args.model_path, use_cuda=args.cuda)
+        train(render=args.render, model_path=args.model_path, use_cuda=args.cuda, resume=args.resume)
