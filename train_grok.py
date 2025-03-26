@@ -90,16 +90,21 @@ class MarioEnv(gym.Env):
         self.total_reward = 0.0
         self.stall_counter = 0
         self.jump_frames = 0
-        self.epsilon = max(0.1, self.epsilon - 0.000045)
+        self.epsilon = max(0.1, self.epsilon - 0.000009)  # Slower decay over 100k steps
         return self._get_observation(), {"steps": self.steps}
 
     def step(self, action):
         stop_moving(self.pyboy)
         if self.jump_frames == 0: stop_jumping(self.pyboy)
         
+        current_x = get_mario_position(self.pyboy)[0]
         if np.random.random() < self.epsilon:
             action = np.random.randint(3)
             logger.debug(f"Epsilon-greedy: Forced action={action}")
+        elif 90 <= current_x <= 100:  # Goomba zone
+            action = 2  # Force right+jump near Goombas
+            self.jump_frames = 20
+            logger.debug(f"Goomba zone ({current_x}): Forced action=2")
 
         if self.stall_counter > 3:
             action = 2
@@ -150,8 +155,9 @@ class MarioEnv(gym.Env):
 
     def _get_reward(self, action, mario_x, mario_y):
         progress_reward = 10.0 if mario_x > self.prev_x else 0
-        jump_reward = 50.0 if mario_y < self.prev_y and action == 2 else 0
+        jump_reward = 100.0 if action == 2 and mario_y < self.prev_y else 0  # Boosted jump reward
         death_penalty = -100.0 if get_lives(self.pyboy) < self.prev_lives else 0
+        goomba_bonus = 50.0 if action == 2 and 90 <= mario_x <= 100 else 0  # Bonus for jumping in Goomba zone
         
         if mario_x == self.prev_x:
             self.stall_counter += 1
@@ -159,8 +165,8 @@ class MarioEnv(gym.Env):
             self.stall_counter = 0
         stall_penalty = -20.0 if self.stall_counter > 3 else 0
         
-        total_reward = progress_reward + jump_reward + death_penalty + stall_penalty
-        logger.debug(f"Reward: progress={progress_reward}, jump={jump_reward}, death={death_penalty}, stall={stall_penalty}, total={total_reward}")
+        total_reward = progress_reward + jump_reward + death_penalty + stall_penalty + goomba_bonus
+        logger.debug(f"Reward: progress={progress_reward}, jump={jump_reward}, death={death_penalty}, stall={stall_penalty}, goomba={goomba_bonus}, total={total_reward}")
         return total_reward
 
     def _is_done(self):
@@ -247,14 +253,14 @@ def train(render=False, model_path="mario_ppo.zip", use_cuda=False, resume=False
     device = 'cuda' if use_cuda and torch.cuda.is_available() else 'cpu'
     logger.info(f"Using device: {device}")
     
-    total_timesteps = 500_000
+    total_timesteps = 1_000_000
     completed_timesteps = 0
 
     if resume and os.path.exists(model_path):
         model = PPO.load(model_path, env=env, device=device)
         logger.info(f"Resumed model from {model_path}")
         if base_env.unwrapped.load_state("mario_state.sav"):
-            completed_timesteps = model.num_timesteps  # Approximate from model
+            completed_timesteps = model.num_timesteps
             logger.info(f"Resuming from {completed_timesteps} timesteps")
     else:
         model = PPO(
@@ -265,7 +271,7 @@ def train(render=False, model_path="mario_ppo.zip", use_cuda=False, resume=False
             n_steps=2048,
             batch_size=256,
             n_epochs=5,
-            ent_coef=0.1,
+            ent_coef=0.2,  # Increased for more exploration
             device=device
         )
         logger.info("Starting fresh training")
