@@ -65,7 +65,7 @@ class MarioEnv(gym.Env):
         self.rom_path = rom_path
         self.render_enabled = render
         self.pyboy = PyBoy(rom_path, window="SDL2" if render else "null", sound=False)
-        self.action_space = gym.spaces.Discrete(5)  # Reduced from 6 to 5, removing "do nothing"
+        self.action_space = gym.spaces.Discrete(5)
         self.observation_space = gym.spaces.Box(low=0, high=255, shape=(144, 160, 3), dtype=np.uint8)
         self.frame_skip = 4
         self.closed = False
@@ -86,7 +86,7 @@ class MarioEnv(gym.Env):
         self.visited_x = set()
         self.total_reward = 0.0
         self.last_action = None
-        self.action_counts = {i: 0 for i in range(5)}  # Updated to 5 actions
+        self.action_counts = {i: 0 for i in range(5)}
 
     def reset(self, seed=None, options=None):
         if not self.closed and hasattr(self, 'pyboy'):
@@ -117,7 +117,7 @@ class MarioEnv(gym.Env):
         self.visited_x = {self.prev_x}
         self.total_reward = 0.0
         self.last_action = None
-        self.action_counts = {i: 0 for i in range(5)}  # Updated to 5 actions
+        self.action_counts = {i: 0 for i in range(5)}
         observation = self._get_observation()
         info = {"steps": self.steps, "total_reward": self.total_reward}
         logger.info(f"Reset: Lives={self.prev_lives}, X={self.prev_x}, Y={self.prev_y}")
@@ -129,33 +129,31 @@ class MarioEnv(gym.Env):
         stop_moving(self.pyboy)
         stop_jumping(self.pyboy)
         reward = 0
-        action_scalar = action[0] if isinstance(action, np.ndarray) else action  # Extract scalar from array
+        action_scalar = action[0] if isinstance(action, np.ndarray) else action
         for _ in range(self.frame_skip):
-            if action_scalar == 0:
+            if action_scalar == 0:  # Move right
                 move_right(self.pyboy)
                 self.pyboy.tick()
-            elif action_scalar == 1:
+            elif action_scalar == 1:  # Jump
                 jump(self.pyboy)
                 self.pyboy.tick()
-                stop_jumping(self.pyboy)
-            elif action_scalar == 2:
+            elif action_scalar == 2:  # Move right + jump
                 move_right(self.pyboy)
                 jump(self.pyboy)
                 self.pyboy.tick()
-                stop_jumping(self.pyboy)
-            elif action_scalar == 3:
+            elif action_scalar == 3:  # Move left
                 move_left(self.pyboy)
                 self.pyboy.tick()
-                stop_left(self.pyboy)
-            elif action_scalar == 4:
+            elif action_scalar == 4:  # Move left + jump
                 move_left(self.pyboy)
                 jump(self.pyboy)
                 self.pyboy.tick()
-                stop_jumping(self.pyboy)
-                stop_left(self.pyboy)
             reward += self._get_reward(action_scalar)
             if self._is_done():
                 break
+        if action_scalar in [1, 2, 4]:
+            stop_jumping(self.pyboy)
+        stop_moving(self.pyboy)
         
         self.steps += 1
         self.action_counts[action_scalar] += 1
@@ -167,7 +165,7 @@ class MarioEnv(gym.Env):
         
         self.last_action = action_scalar
         truncated = False
-        info = {"steps": self.steps, "total_reward": self.total_reward, "action_counts": self.action_counts}
+        info = {"steps": self.steps, "total_reward": self.total_reward, "action_counts": self.action_counts, "x_pos": current_x}
         if terminated:
             logger.info(f"Episode ended: action={action_scalar}, reward={reward}, total_reward={self.total_reward}, lives={get_lives(self.pyboy)}, x={self.prev_x}, action_counts={self.action_counts}")
         if self.render_enabled:
@@ -190,14 +188,16 @@ class MarioEnv(gym.Env):
         current_coins = get_coins(self.pyboy)
         current_lives = get_lives(self.pyboy)
         current_world = get_world_level(self.pyboy)
-        progress_reward = (mario_x - self.prev_x) * 10.0 if mario_x > self.prev_x else 0
-        movement_penalty = -0.5 if mario_x <= self.prev_x else 0
-        left_penalty = -1.0 if action in [3, 4] else 0  # Adjusted for new action indices
+        progress_reward = (mario_x - self.prev_x) * 20.0 if mario_x > self.prev_x else 0
+        movement_penalty = -1.0 if mario_x <= self.prev_x else 0
+        left_penalty = -5.0 if action in [3, 4] else 0
+        jump_reward = 0.5 if mario_y < self.prev_y else 0
         coin_reward = (current_coins - self.prev_coins) * 5.0
         death_penalty = -50.0 if current_lives < self.prev_lives else 0
         survival_reward = 0.01
         stage_complete = 50.0 if current_world > self.prev_world else 0
-        total_reward = progress_reward + movement_penalty + left_penalty + coin_reward + survival_reward + death_penalty + stage_complete
+        total_reward = progress_reward + movement_penalty + left_penalty + jump_reward + coin_reward + survival_reward + death_penalty + stage_complete
+        logger.debug(f"Reward breakdown: progress={progress_reward}, move_penalty={movement_penalty}, left_penalty={left_penalty}, jump={jump_reward}, coins={coin_reward}, death={death_penalty}, survival={survival_reward}, stage={stage_complete}, total={total_reward}")
         return np.clip(total_reward, -10.0, 10.0)
 
     def _is_done(self):
@@ -241,37 +241,63 @@ class MarioEnv(gym.Env):
         except Exception as e:
             logger.error(f"Failed to load state: {e}")
 
-class MambaExtractor(BaseFeaturesExtractor):
+class CNNExtractor(BaseFeaturesExtractor):
     def __init__(self, observation_space: gym.spaces.Box, feature_dim: int = 256):
-        super(MambaExtractor, self).__init__(observation_space, feature_dim)
+        super(CNNExtractor, self).__init__(observation_space, feature_dim)
+        # Observation space after FrameStack: (num_stack, height, width, channels)
         self.stack_size, self.image_height, self.image_width, self.image_channels = observation_space.shape
-        input_dim = self.stack_size * self.image_height * self.image_width * self.image_channels
-        self.flatten = nn.Flatten()
-        self.linear = nn.Linear(input_dim, feature_dim)
-        logger.debug(f"MambaExtractor initialized: input_dim={input_dim}, feature_dim={feature_dim}")
+        
+        # CNN expects (batch_size, channels, height, width) with channels = stack_size * image_channels
+        self.cnn = nn.Sequential(
+            nn.Conv2d(self.stack_size * self.image_channels, 32, kernel_size=8, stride=4),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.ReLU(),
+            nn.Flatten(),
+        )
+        
+        # Compute CNN output size
+        with torch.no_grad():
+            sample_input = torch.zeros(1, self.stack_size * self.image_channels, self.image_height, self.image_width)
+            cnn_output = self.cnn(sample_input)
+            n_flatten = cnn_output.shape[1]
+        
+        self.fc = nn.Linear(n_flatten, feature_dim)
+        logger.debug(f"CNNExtractor initialized: input_channels={self.stack_size * self.image_channels}, feature_dim={feature_dim}")
 
     def forward(self, observations):
         logger.debug(f"Input observations shape: {observations.shape}, dtype: {observations.dtype}")
-        x = observations.float() / 255.0
-        logger.debug(f"After conversion shape: {x.shape}, dtype: {x.dtype}")
-        x = self.flatten(x)
-        logger.debug(f"Flattened shape: {x.shape}")
-        features = self.linear(x)
+        # Handle 5D input from DummyVecEnv: (num_envs, stack_size, height, width, channels)
+        if observations.dim() == 5:
+            batch_size = observations.shape[0]  # Usually 1 with DummyVecEnv
+            observations = observations.view(batch_size, -1, self.image_height, self.image_width)  # Combine stack_size * channels
+            logger.debug(f"After view shape: {observations.shape}")
+        x = observations.float() / 255.0  # Normalize
+        x = x.permute(0, 1, 2, 3)  # Ensure (batch, channels, height, width)
+        logger.debug(f"After permute shape: {x.shape}")
+        features = self.cnn(x)
+        logger.debug(f"CNN output shape: {features.shape}")
+        features = self.fc(features)
         logger.debug(f"Output features shape: {features.shape}")
         return features
 
-class MambaPolicy(ActorCriticPolicy):
+class CNNPolicy(ActorCriticPolicy):
     def __init__(self, *args, **kwargs):
-        super(MambaPolicy, self).__init__(
+        super(CNNPolicy, self).__init__(
             *args,
             **kwargs,
-            features_extractor_class=MambaExtractor,
+            features_extractor_class=CNNExtractor,
             features_extractor_kwargs={'feature_dim': 256},
             net_arch=dict(pi=[256], vf=[256])
         )
         self.actor_net = nn.Linear(256, self.action_space.n)
         self.value_net = nn.Linear(256, 1)
-        logger.debug(f"Initialized MambaPolicy: actor_net={self.actor_net}, value_net={self.value_net}")
+        with torch.no_grad():
+            self.actor_net.weight.data.fill_(0)
+            self.actor_net.bias.data = torch.tensor([1.0, 0.0, 1.0, -1.0, -1.0])
+        logger.debug(f"Initialized CNNPolicy: actor_net={self.actor_net}, value_net={self.value_net}")
 
     def _get_features(self, obs):
         features = self.features_extractor(obs)
@@ -316,7 +342,7 @@ def signal_handler(sig, frame, env, model):
             env.close()
         if model:
             logger.debug("Saving model...")
-            model.save("grok_mamba")
+            model.save("grok_cnn")
         logger.info("State and model saved. Exiting gracefully...")
         gc.collect()
         if torch.cuda.is_available():
@@ -336,6 +362,7 @@ class AutosaveCallback(BaseCallback):
         self.initial_timesteps = initial_timesteps
         self.interval = interval
         self.last_save = initial_timesteps
+        self.start_time = time.time()
 
     def _on_step(self):
         if should_exit:
@@ -349,17 +376,29 @@ class AutosaveCallback(BaseCallback):
         current_session_timesteps = self.num_timesteps
         total_timesteps_so_far = current_session_timesteps + self.initial_timesteps
         percentage_complete = (total_timesteps_so_far / self.total_timesteps) * 100
-        logger.info(f"Callback: Total timesteps = {total_timesteps_so_far}/{self.total_timesteps}, Progress = {percentage_complete:.2f}%")
+        
+        elapsed_time = time.time() - self.start_time
+        if total_timesteps_so_far > self.initial_timesteps:
+            steps_per_second = (total_timesteps_so_far - self.initial_timesteps) / elapsed_time
+            remaining_steps = self.total_timesteps - total_timesteps_so_far
+            remaining_seconds = remaining_steps / steps_per_second if steps_per_second > 0 else 0
+            remaining_hours = remaining_seconds / 3600
+        else:
+            remaining_hours = float('inf')
+        
+        logger.info(f"Callback: Total timesteps = {total_timesteps_so_far}/{self.total_timesteps}, "
+                    f"Progress = {percentage_complete:.2f}%, Estimated hours left = {remaining_hours:.2f}")
+        
         if total_timesteps_so_far - self.last_save >= self.interval:
             logger.info(f"Autosaving at timestep {total_timesteps_so_far} ({percentage_complete:.2f}%)...")
             monitor_env = self.env.envs[0]
             frame_stack_env = monitor_env.env
             mario_env = frame_stack_env.unwrapped
             mario_env.save_state("mario_state_autosave.sav")
-            self.model.save("grok_mamba_autosave")
+            self.model.save("grok_cnn_autosave")
             self.last_save = total_timesteps_so_far
 
-def train_rl_agent(render=False, resume=False, use_cuda=False, model_path="grok_mamba.zip"):
+def train_rl_agent(render=False, resume=False, use_cuda=False, model_path="grok_cnn.zip"):
     global should_exit
     should_exit = False
 
@@ -377,14 +416,14 @@ def train_rl_agent(render=False, resume=False, use_cuda=False, model_path="grok_
         logger.warning("CUDA requested but not available, falling back to CPU")
 
     if resume and os.path.exists(model_path):
-        model = PPO.load(model_path, env=env, device=device, custom_objects={"policy_class": MambaPolicy})
+        model = PPO.load(model_path, env=env, device=device, custom_objects={"policy_class": CNNPolicy})
         logger.debug(f"Loaded model policy: actor_net={model.policy.actor_net}, value_net={model.policy.value_net}")
         initial_timesteps = model.num_timesteps
         remaining_timesteps = total_training_timesteps - initial_timesteps
         logger.info(f"Resuming from {initial_timesteps} timesteps, {remaining_timesteps} remaining")
     else:
         model = PPO(
-            MambaPolicy,
+            CNNPolicy,
             env,
             verbose=2,
             learning_rate=0.0001,
@@ -415,8 +454,8 @@ def train_rl_agent(render=False, resume=False, use_cuda=False, model_path="grok_
         )
         total_timesteps_so_far = model.num_timesteps
         percentage_complete = (total_timesteps_so_far / total_training_timesteps) * 100
-        model.save("grok_mamba")
-        logger.info(f"Training complete. Saved 'grok_mamba.zip'. Total timesteps: {total_timesteps_so_far}, Progress: {percentage_complete:.2f}%")
+        model.save("grok_cnn")
+        logger.info(f"Training complete. Saved 'grok_cnn.zip'. Total timesteps: {total_timesteps_so_far}, Progress: {percentage_complete:.2f}%")
     except TrainingInterrupt:
         logger.info("Training interrupted by signal handler")
     except KeyboardInterrupt:
@@ -455,13 +494,14 @@ def train_rl_agent(render=False, resume=False, use_cuda=False, model_path="grok_
             obs, rewards, dones, infos = play_vec_env.step(action)
             total_reward += rewards[0]
             play_vec_env.render()
+            logger.debug(f"Step {step}: X={infos[0]['x_pos']}, Action={action}, Reward={rewards[0]}")
             if dones[0]:
                 logger.info(f"Episode ended. Reward: {total_reward}, Steps: {infos[0]['steps']}, Action Counts: {infos[0]['action_counts']}")
                 obs = play_vec_env.reset()
                 total_reward = 0
         play_vec_env.close()
 
-def play(model_path="grok_mamba.zip", state_path="mario_state.sav", use_cuda=False):
+def play(model_path="grok_cnn.zip", state_path="mario_state.sav", use_cuda=False):
     global should_exit
     should_exit = False
 
@@ -477,7 +517,7 @@ def play(model_path="grok_mamba.zip", state_path="mario_state.sav", use_cuda=Fal
             logger.warning("CUDA requested but not available")
         
         logger.info(f"Loading model from {model_path}")
-        model = PPO.load(model_path, env=env, device=device, custom_objects={"policy_class": MambaPolicy})
+        model = PPO.load(model_path, env=env, device=device, custom_objects={"policy_class": CNNPolicy})
         logger.debug(f"Loaded model policy: actor_net={model.policy.actor_net}, value_net={model.policy.value_net}")
         logger.debug(f"Post-load self.forward type: {type(model.policy.forward)}")
         logger.info("Model loaded!")
@@ -496,6 +536,7 @@ def play(model_path="grok_mamba.zip", state_path="mario_state.sav", use_cuda=Fal
             obs, rewards, dones, infos = env.step(action)
             total_reward += rewards[0]
             env.render()
+            logger.debug(f"Step {step}: X={infos[0]['x_pos']}, Action={action}, Reward={rewards[0]}")
             if dones[0]:
                 logger.info(f"Episode ended. Reward: {total_reward}, Steps: {infos[0]['steps']}, Action Counts: {infos[0]['action_counts']}")
                 obs = env.reset()
@@ -529,7 +570,7 @@ if __name__ == "__main__":
     parser.add_argument('--resume', action='store_true', help="Resume training")
     parser.add_argument('--debug', action='store_true', help="Enable debug logging")
     parser.add_argument('--cuda', action='store_true', help="Use CUDA")
-    parser.add_argument('--model_path', type=str, default="grok_mamba.zip", help="Path to the model file to load")
+    parser.add_argument('--model_path', type=str, default="grok_cnn.zip", help="Path to the model file to load")
     args = parser.parse_args()
 
     logger = setup_logging(debug=args.debug)
