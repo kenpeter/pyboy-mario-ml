@@ -1,57 +1,44 @@
-from pyboy import PyBoy
-from pyboy.utils import WindowEvent
-import time
 import numpy as np
 import gymnasium as gym
-try:
-    from gymnasium.wrappers.frame_stack import FrameStack
-except ImportError:
-    import logging
-    logging.error("FrameStack not found in gymnasium.wrappers.frame_stack. Please check gymnasium version.")
-    raise
-
+from gymnasium.wrappers import FrameStack, GrayScaleObservation, ResizeObservation
+from pyboy import PyBoy
+from pyboy.utils import WindowEvent
 from stable_baselines3 import PPO
-from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv
-from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 import torch
 import torch.nn as nn
-from stable_baselines3.common.policies import ActorCriticPolicy
-from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
-from torch.distributions import Categorical
+import logging
+import time
+import os
 import signal
 import sys
-import os
-import logging
 import argparse
 import gc
 
-class TrainingInterrupt(Exception):
-    pass
-
+# Logging setup
 def setup_logging(debug=False):
-    logging_level = logging.DEBUG if debug else logging.INFO
-    logging.basicConfig(level=logging_level, format='%(asctime)s - %(levelname)s - %(message)s')
+    level = logging.DEBUG if debug else logging.INFO
+    logging.basicConfig(level=level, format='%(asctime)s - %(levelname)s - %(message)s')
     logger = logging.getLogger(__name__)
-    logger.info(f"Logging level set to: {logging.getLevelName(logging_level)}")
+    logger.info(f"Logging level set to: {logging.getLevelName(level)}")
     return logger
 
+# Memory addresses
 MARIO_X_POS = 0xC202
 MARIO_Y_POS = 0xC201
 LIVES = 0xDA15
 COINS = 0xFFFA
 WORLD_LEVEL = 0xFFB4
 
+# PyBoy controls
 def get_mario_position(pyboy): return pyboy.memory[MARIO_X_POS], pyboy.memory[MARIO_Y_POS]
 def get_lives(pyboy): return pyboy.memory[LIVES]
-def get_coins(pyboy): return pyboy.memory[COINS]
-def get_world_level(pyboy): return pyboy.memory[WORLD_LEVEL]
 def move_right(pyboy): pyboy.send_input(WindowEvent.PRESS_ARROW_RIGHT)
-def stop_moving(pyboy):
+def stop_moving(pyboy): 
     pyboy.send_input(WindowEvent.RELEASE_ARROW_RIGHT)
     pyboy.send_input(WindowEvent.RELEASE_ARROW_LEFT)
-def move_left(pyboy): pyboy.send_input(WindowEvent.PRESS_ARROW_LEFT)
-def stop_left(pyboy): pyboy.send_input(WindowEvent.RELEASE_ARROW_LEFT)
 def jump(pyboy): pyboy.send_input(WindowEvent.PRESS_BUTTON_A)
 def stop_jumping(pyboy): pyboy.send_input(WindowEvent.RELEASE_BUTTON_A)
 def press_start(pyboy):
@@ -61,11 +48,11 @@ def press_start(pyboy):
 
 class MarioEnv(gym.Env):
     def __init__(self, rom_path, render=False):
-        super(MarioEnv, self).__init__()
+        super().__init__()
         self.rom_path = rom_path
         self.render_enabled = render
         self.pyboy = PyBoy(rom_path, window="SDL2" if render else "null", sound=False)
-        self.action_space = gym.spaces.Discrete(5)
+        self.action_space = gym.spaces.Discrete(3)  # 0=Right, 1=Jump, 2=Right+Jump
         self.observation_space = gym.spaces.Box(low=0, high=255, shape=(144, 160, 3), dtype=np.uint8)
         self.frame_skip = 4
         self.closed = False
@@ -77,179 +64,124 @@ class MarioEnv(gym.Env):
             if get_lives(self.pyboy) > 0: break
         self.initial_lives = get_lives(self.pyboy)
 
-        self.prev_coins = get_coins(self.pyboy)
         self.prev_x = get_mario_position(self.pyboy)[0]
         self.prev_y = get_mario_position(self.pyboy)[1]
         self.prev_lives = get_lives(self.pyboy)
-        self.prev_world = get_world_level(self.pyboy)
         self.steps = 0
-        self.visited_x = set()
         self.total_reward = 0.0
-        self.last_action = None
-        self.action_counts = {i: 0 for i in range(5)}
+        self.stall_counter = 0
+        self.jump_frames = 0
+        self.epsilon = 1.0
 
     def reset(self, seed=None, options=None):
-        if not self.closed and hasattr(self, 'pyboy'):
+        if not self.closed:
             self.pyboy.stop(save=False)
         self.pyboy = PyBoy(self.rom_path, window="SDL2" if self.render_enabled else "null", sound=False)
-        self.closed = False
         press_start(self.pyboy)
         for i in range(300):
             self.pyboy.tick()
             if i == 150: press_start(self.pyboy)
-            lives = get_lives(self.pyboy)
-            if lives > 0:
-                logger.info(f"Game started with {lives} lives at tick {i}")
-                self.initial_lives = lives
-                break
-        else:
-            logger.error("Failed to start game with lives > 0 after 300 ticks")
-            raise RuntimeError("Could not initialize game with lives")
+            if get_lives(self.pyboy) > 0: break
         
-        for _ in range(15): self.pyboy.tick()
-        
-        self.prev_coins = get_coins(self.pyboy)
         self.prev_x = get_mario_position(self.pyboy)[0]
         self.prev_y = get_mario_position(self.pyboy)[1]
         self.prev_lives = get_lives(self.pyboy)
-        self.prev_world = get_world_level(self.pyboy)
         self.steps = 0
-        self.visited_x = {self.prev_x}
         self.total_reward = 0.0
-        self.last_action = None
-        self.action_counts = {i: 0 for i in range(5)}
-        observation = self._get_observation()
-        info = {"steps": self.steps, "total_reward": self.total_reward}
-        logger.info(f"Reset: Lives={self.prev_lives}, X={self.prev_x}, Y={self.prev_y}")
-        return observation, info
+        self.stall_counter = 0
+        self.jump_frames = 0
+        self.epsilon = max(0.1, self.epsilon - 0.000045)
+        return self._get_observation(), {"steps": self.steps}
 
     def step(self, action):
-        if self.closed:
-            raise RuntimeError("Environment is closed")
         stop_moving(self.pyboy)
-        stop_jumping(self.pyboy)
+        if self.jump_frames == 0: stop_jumping(self.pyboy)
+        
+        if np.random.random() < self.epsilon:
+            action = np.random.randint(3)
+            logger.debug(f"Epsilon-greedy: Forced action={action}")
+
+        if self.stall_counter > 3:
+            action = 2
+            self.jump_frames = 20
+            logger.debug("Stall detected, forcing action=2")
+
         reward = 0
-        action_scalar = action[0] if isinstance(action, np.ndarray) else action
-        for _ in range(self.frame_skip):
-            if action_scalar == 0:  # Move right
+        for frame in range(self.frame_skip):
+            if action == 0:
                 move_right(self.pyboy)
                 self.pyboy.tick()
-            elif action_scalar == 1:  # Jump
-                jump(self.pyboy)
+            elif action == 1:
+                if frame == 0: self.jump_frames = 20
+                if self.jump_frames > 0:
+                    jump(self.pyboy)
+                    self.jump_frames -= 1
                 self.pyboy.tick()
-            elif action_scalar == 2:  # Move right + jump
+            elif action == 2:
                 move_right(self.pyboy)
-                jump(self.pyboy)
+                if frame == 0: self.jump_frames = 20
+                if self.jump_frames > 0:
+                    jump(self.pyboy)
+                    self.jump_frames -= 1
                 self.pyboy.tick()
-            elif action_scalar == 3:  # Move left
-                move_left(self.pyboy)
-                self.pyboy.tick()
-            elif action_scalar == 4:  # Move left + jump
-                move_left(self.pyboy)
-                jump(self.pyboy)
-                self.pyboy.tick()
-            reward += self._get_reward(action_scalar)
-            if self._is_done():
-                break
-        if action_scalar in [1, 2, 4]:
-            stop_jumping(self.pyboy)
+            mario_x, mario_y = get_mario_position(self.pyboy)
+            reward += self._get_reward(action, mario_x, mario_y)
+            if self._is_done(): break
+        
+        if self.jump_frames == 0: stop_jumping(self.pyboy)
         stop_moving(self.pyboy)
         
         self.steps += 1
-        self.action_counts[action_scalar] += 1
         observation = self._get_observation()
         self.total_reward += reward
         terminated = self._is_done()
         current_x = get_mario_position(self.pyboy)[0]
         current_y = get_mario_position(self.pyboy)[1]
         
-        self.last_action = action_scalar
-        truncated = False
-        info = {"steps": self.steps, "total_reward": self.total_reward, "action_counts": self.action_counts, "x_pos": current_x}
-        if terminated:
-            logger.info(f"Episode ended: action={action_scalar}, reward={reward}, total_reward={self.total_reward}, lives={get_lives(self.pyboy)}, x={self.prev_x}, action_counts={self.action_counts}")
-        if self.render_enabled:
-            self.pyboy.tick()
-        self.prev_coins = get_coins(self.pyboy)
         self.prev_x = current_x
         self.prev_y = current_y
         self.prev_lives = get_lives(self.pyboy)
-        self.prev_world = get_world_level(self.pyboy)
-        return observation, reward, terminated, truncated, info
+        info = {"steps": self.steps, "x_pos": current_x}
+        return observation, reward, terminated, False, info
 
     def _get_observation(self):
-        if self.closed:
-            raise RuntimeError("Cannot get observation from closed environment")
-        screen_image = np.array(self.pyboy.screen.ndarray)
-        return screen_image[:, :, :3] if screen_image.shape[-1] == 4 else screen_image
+        screen = np.array(self.pyboy.screen.ndarray)[..., :3]  # [144, 160, 3]
+        return screen
 
-    def _get_reward(self, action):
-        mario_x, mario_y = get_mario_position(self.pyboy)
-        current_coins = get_coins(self.pyboy)
-        current_lives = get_lives(self.pyboy)
-        current_world = get_world_level(self.pyboy)
-        progress_reward = (mario_x - self.prev_x) * 20.0 if mario_x > self.prev_x else 0
-        movement_penalty = -1.0 if mario_x <= self.prev_x else 0
-        left_penalty = -5.0 if action in [3, 4] else 0
-        jump_reward = 0.5 if mario_y < self.prev_y else 0
-        coin_reward = (current_coins - self.prev_coins) * 5.0
-        death_penalty = -50.0 if current_lives < self.prev_lives else 0
-        survival_reward = 0.01
-        stage_complete = 50.0 if current_world > self.prev_world else 0
-        total_reward = progress_reward + movement_penalty + left_penalty + jump_reward + coin_reward + survival_reward + death_penalty + stage_complete
-        logger.debug(f"Reward breakdown: progress={progress_reward}, move_penalty={movement_penalty}, left_penalty={left_penalty}, jump={jump_reward}, coins={coin_reward}, death={death_penalty}, survival={survival_reward}, stage={stage_complete}, total={total_reward}")
-        return np.clip(total_reward, -10.0, 10.0)
+    def _get_reward(self, action, mario_x, mario_y):
+        progress_reward = 10.0 if mario_x > self.prev_x else 0
+        jump_reward = 50.0 if mario_y < self.prev_y and action == 2 else 0
+        death_penalty = -100.0 if get_lives(self.pyboy) < self.prev_lives else 0
+        
+        if mario_x == self.prev_x:
+            self.stall_counter += 1
+        else:
+            self.stall_counter = 0
+        stall_penalty = -20.0 if self.stall_counter > 3 else 0
+        
+        total_reward = progress_reward + jump_reward + death_penalty + stall_penalty
+        logger.debug(f"Reward: progress={progress_reward}, jump={jump_reward}, death={death_penalty}, stall={stall_penalty}, total={total_reward}")
+        return total_reward
 
     def _is_done(self):
         return get_lives(self.pyboy) == 0
 
-    def render(self, mode='human'):
-        if self.closed:
-            raise RuntimeError("Cannot render closed environment")
-        if self.render_enabled and mode == 'human':
-            pass
-        elif mode == 'rgb_array':
-            return self._get_observation()
-
     def close(self):
-        logger.debug("Closing MarioEnv...")
-        if not self.closed and hasattr(self, 'pyboy') and self.pyboy is not None:
+        if not self.closed:
             self.pyboy.stop(save=False)
-            self.pyboy = None
             self.closed = True
-        logger.debug("MarioEnv closed.")
 
     def save_state(self, path):
-        if self.closed:
-            logger.warning("Cannot save state of closed environment")
-            return
-        try:
+        if not self.closed:
             with open(path, 'wb') as f:
                 self.pyboy.save_state(f)
             logger.info(f"Saved state to {path}")
-        except Exception as e:
-            logger.error(f"Failed to save state: {e}")
-
-    def load_state(self, path):
-        if self.closed:
-            logger.warning("Cannot load state into closed environment")
-            return
-        try:
-            with open(path, 'rb') as f:
-                self.pyboy.load_state(f)
-            logger.info(f"Loaded state from {path}")
-        except Exception as e:
-            logger.error(f"Failed to load state: {e}")
 
 class CNNExtractor(BaseFeaturesExtractor):
-    def __init__(self, observation_space: gym.spaces.Box, feature_dim: int = 256):
-        super(CNNExtractor, self).__init__(observation_space, feature_dim)
-        # Observation space after FrameStack: (num_stack, height, width, channels)
-        self.stack_size, self.image_height, self.image_width, self.image_channels = observation_space.shape
-        
-        # CNN expects (batch_size, channels, height, width) with channels = stack_size * image_channels
+    def __init__(self, observation_space: gym.spaces.Box, features_dim: int = 256):
+        super().__init__(observation_space, features_dim)
         self.cnn = nn.Sequential(
-            nn.Conv2d(self.stack_size * self.image_channels, 32, kernel_size=8, stride=4),
+            nn.Conv2d(4, 32, kernel_size=8, stride=4),
             nn.ReLU(),
             nn.Conv2d(32, 64, kernel_size=4, stride=2),
             nn.ReLU(),
@@ -257,80 +189,22 @@ class CNNExtractor(BaseFeaturesExtractor):
             nn.ReLU(),
             nn.Flatten(),
         )
-        
-        # Compute CNN output size
-        with torch.no_grad():
-            sample_input = torch.zeros(1, self.stack_size * self.image_channels, self.image_height, self.image_width)
-            cnn_output = self.cnn(sample_input)
-            n_flatten = cnn_output.shape[1]
-        
-        self.fc = nn.Linear(n_flatten, feature_dim)
-        logger.debug(f"CNNExtractor initialized: input_channels={self.stack_size * self.image_channels}, feature_dim={feature_dim}")
+        self.fc = nn.Linear(3136, features_dim)
+        self._features_dim = features_dim
 
-    def forward(self, observations):
-        logger.debug(f"Input observations shape: {observations.shape}, dtype: {observations.dtype}")
-        # Handle 5D input from DummyVecEnv: (num_envs, stack_size, height, width, channels)
-        if observations.dim() == 5:
-            batch_size = observations.shape[0]  # Usually 1 with DummyVecEnv
-            observations = observations.view(batch_size, -1, self.image_height, self.image_width)  # Combine stack_size * channels
-            logger.debug(f"After view shape: {observations.shape}")
-        x = observations.float() / 255.0  # Normalize
-        x = x.permute(0, 1, 2, 3)  # Ensure (batch, channels, height, width)
-        logger.debug(f"After permute shape: {x.shape}")
-        features = self.cnn(x)
-        logger.debug(f"CNN output shape: {features.shape}")
-        features = self.fc(features)
-        logger.debug(f"Output features shape: {features.shape}")
-        return features
-
-class CNNPolicy(ActorCriticPolicy):
-    def __init__(self, *args, **kwargs):
-        super(CNNPolicy, self).__init__(
-            *args,
-            **kwargs,
-            features_extractor_class=CNNExtractor,
-            features_extractor_kwargs={'feature_dim': 256},
-            net_arch=dict(pi=[256], vf=[256])
-        )
-        self.actor_net = nn.Linear(256, self.action_space.n)
-        self.value_net = nn.Linear(256, 1)
-        with torch.no_grad():
-            self.actor_net.weight.data.fill_(0)
-            self.actor_net.bias.data = torch.tensor([1.0, 0.0, 1.0, -1.0, -1.0])
-        logger.debug(f"Initialized CNNPolicy: actor_net={self.actor_net}, value_net={self.value_net}")
-
-    def _get_features(self, obs):
-        features = self.features_extractor(obs)
-        logger.debug(f"Extracted features shape: {features.shape}")
-        return features
-
-    def forward(self, obs, deterministic=False):
-        features = self._get_features(obs)
-        logits = self.actor_net(features)
-        values = self.value_net(features)
-        distribution = Categorical(logits=logits)
-        actions = distribution.mode() if deterministic else distribution.sample()
-        log_probs = distribution.log_prob(actions)
-        return actions, values, log_probs
-
-    def evaluate_actions(self, obs, actions):
-        features = self._get_features(obs)
-        logits = self.actor_net(features)
-        values = self.value_net(features)
-        distribution = Categorical(logits=logits)
-        log_prob = distribution.log_prob(actions)
-        entropy = distribution.entropy()
-        return values, log_prob, entropy
+    def forward(self, x):
+        x = x.float() / 255.0
+        return self.fc(self.cnn(x))
 
 should_exit = False
 
-def signal_handler(sig, frame, env, model):
+def signal_handler(sig, frame, env, model, model_path):
     global should_exit
     if should_exit:
         logger.debug("Signal handler called again, ignoring...")
         return
     should_exit = True
-    logger.info("Ctrl+C detected! Saving state...")
+    logger.info("Ctrl+C detected! Saving state and model...")
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     try:
         if env:
@@ -338,253 +212,95 @@ def signal_handler(sig, frame, env, model):
             frame_stack_env = monitor_env.env
             mario_env = frame_stack_env.unwrapped
             mario_env.save_state("mario_state.sav")
-            logger.debug("Closing vectorized environment...")
             env.close()
         if model:
-            logger.debug("Saving model...")
-            model.save("grok_cnn")
-        logger.info("State and model saved. Exiting gracefully...")
-        gc.collect()
+            model.save(model_path)
+        logger.info(f"Saved model to {model_path} and state to mario_state.sav")
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        time.sleep(0.2)
-        raise TrainingInterrupt("Training interrupted by user")
+        gc.collect()
+        sys.exit(0)
     except Exception as e:
-        logger.error(f"Error in signal handler: {e}")
-        raise
+        logger.error(f"Error during save: {e}")
+        sys.exit(1)
 
-class AutosaveCallback(BaseCallback):
-    def __init__(self, env, model, total_timesteps, initial_timesteps=0, interval=4096, verbose=0):
-        super(AutosaveCallback, self).__init__(verbose)
-        self.env = env
-        self.model = model
-        self.total_timesteps = total_timesteps
-        self.initial_timesteps = initial_timesteps
-        self.interval = interval
-        self.last_save = initial_timesteps
-        self.start_time = time.time()
-
-    def _on_step(self):
-        if should_exit:
-            logger.debug("Stopping training loop due to should_exit")
-            return False
-        return True
-
-    def _on_rollout_end(self):
-        if should_exit:
-            return
-        current_session_timesteps = self.num_timesteps
-        total_timesteps_so_far = current_session_timesteps + self.initial_timesteps
-        percentage_complete = (total_timesteps_so_far / self.total_timesteps) * 100
-        
-        elapsed_time = time.time() - self.start_time
-        if total_timesteps_so_far > self.initial_timesteps:
-            steps_per_second = (total_timesteps_so_far - self.initial_timesteps) / elapsed_time
-            remaining_steps = self.total_timesteps - total_timesteps_so_far
-            remaining_seconds = remaining_steps / steps_per_second if steps_per_second > 0 else 0
-            remaining_hours = remaining_seconds / 3600
-        else:
-            remaining_hours = float('inf')
-        
-        logger.info(f"Callback: Total timesteps = {total_timesteps_so_far}/{self.total_timesteps}, "
-                    f"Progress = {percentage_complete:.2f}%, Estimated hours left = {remaining_hours:.2f}")
-        
-        if total_timesteps_so_far - self.last_save >= self.interval:
-            logger.info(f"Autosaving at timestep {total_timesteps_so_far} ({percentage_complete:.2f}%)...")
-            monitor_env = self.env.envs[0]
-            frame_stack_env = monitor_env.env
-            mario_env = frame_stack_env.unwrapped
-            mario_env.save_state("mario_state_autosave.sav")
-            self.model.save("grok_cnn_autosave")
-            self.last_save = total_timesteps_so_far
-
-def train_rl_agent(render=False, resume=False, use_cuda=False, model_path="grok_cnn.zip"):
-    global should_exit
-    should_exit = False
-
+def train(render=False, model_path="mario_ppo.zip", use_cuda=False):
+    global logger, should_exit
     base_env = MarioEnv('SuperMarioLand.gb', render=render)
+    base_env = GrayScaleObservation(base_env, keep_dim=False)
+    base_env = ResizeObservation(base_env, (84, 84))
     base_env = FrameStack(base_env, num_stack=4)
-    logger.info(f"Base observation space: {base_env.observation_space}")
     env = Monitor(base_env)
     env = DummyVecEnv([lambda: env])
-    logger.info(f"Wrapped observation space: {env.observation_space}")
-    total_training_timesteps = 500_000
     
     device = 'cuda' if use_cuda and torch.cuda.is_available() else 'cpu'
     logger.info(f"Using device: {device}")
-    if use_cuda and not torch.cuda.is_available():
-        logger.warning("CUDA requested but not available, falling back to CPU")
-
-    if resume and os.path.exists(model_path):
-        model = PPO.load(model_path, env=env, device=device, custom_objects={"policy_class": CNNPolicy})
-        logger.debug(f"Loaded model policy: actor_net={model.policy.actor_net}, value_net={model.policy.value_net}")
-        initial_timesteps = model.num_timesteps
-        remaining_timesteps = total_training_timesteps - initial_timesteps
-        logger.info(f"Resuming from {initial_timesteps} timesteps, {remaining_timesteps} remaining")
-    else:
-        model = PPO(
-            CNNPolicy,
-            env,
-            verbose=2,
-            learning_rate=0.0001,
-            n_steps=2048,
-            batch_size=256,
-            n_epochs=5,
-            gamma=0.99,
-            gae_lambda=0.95,
-            clip_range=0.2,
-            ent_coef=10.0,
-            vf_coef=0.5,
-            device=device
-        )
-        initial_timesteps = 0
-        remaining_timesteps = total_training_timesteps
-        logger.info("Starting fresh training")
-
-    signal.signal(signal.SIGINT, lambda sig, frame: signal_handler(sig, frame, env, model))
-    logger.info("Signal handler registered")
-
-    logger.info(f"Starting training for {remaining_timesteps} timesteps (Total: {total_training_timesteps})...")
+    
+    model = PPO(
+        "CnnPolicy",
+        env,
+        policy_kwargs={"features_extractor_class": CNNExtractor, "features_extractor_kwargs": {"features_dim": 256}},
+        learning_rate=0.0001,
+        n_steps=2048,
+        batch_size=256,
+        n_epochs=5,
+        ent_coef=0.1,
+        device=device
+    )
+    
+    signal.signal(signal.SIGINT, lambda sig, frame: signal_handler(sig, frame, env, model, model_path))
+    logger.info("Starting training with progress bar...")
     try:
-        model.learn(
-            total_timesteps=remaining_timesteps,
-            callback=AutosaveCallback(env, model, total_training_timesteps, initial_timesteps),
-            progress_bar=True,
-            reset_num_timesteps=False
-        )
-        total_timesteps_so_far = model.num_timesteps
-        percentage_complete = (total_timesteps_so_far / total_training_timesteps) * 100
-        model.save("grok_cnn")
-        logger.info(f"Training complete. Saved 'grok_cnn.zip'. Total timesteps: {total_timesteps_so_far}, Progress: {percentage_complete:.2f}%")
-    except TrainingInterrupt:
-        logger.info("Training interrupted by signal handler")
+        model.learn(total_timesteps=100_000, progress_bar=True)
+        model.save(model_path)
+        logger.info(f"Training complete. Saved model to {model_path}")
     except KeyboardInterrupt:
-        logger.info("KeyboardInterrupt caught in training, cleanup handled by signal handler")
-    except Exception as e:
-        logger.error(f"Unexpected error during training: {e}")
-        raise
+        logger.info("Training interrupted by Ctrl+C, handled by signal handler")
     finally:
-        logger.debug("Ensuring environment is closed in finally block...")
-        if 'env' in locals():
-            try:
-                env.close()
-            except Exception as e:
-                logger.error(f"Error closing environment: {e}")
-        if torch.cuda.is_available():
-            try:
-                torch.cuda.empty_cache()
-            except Exception as e:
-                logger.error(f"Error clearing CUDA cache: {e}")
-        gc.collect()
-        time.sleep(0.2)
-
-    if not should_exit and render:
-        play_env = MarioEnv('SuperMarioLand.gb', render=True)
-        play_env = FrameStack(play_env, num_stack=4)
-        play_env = Monitor(play_env)
-        play_vec_env = DummyVecEnv([lambda: play_env])
-        obs = play_vec_env.reset()
-        total_reward = 0
-        for step in range(5000):
-            if should_exit:
-                logger.info("Exiting play loop due to Ctrl+C...")
-                break
-            action, _ = model.predict(obs)
-            logger.debug(f"Post-training action: {action}, type: {type(action)}")
-            obs, rewards, dones, infos = play_vec_env.step(action)
-            total_reward += rewards[0]
-            play_vec_env.render()
-            logger.debug(f"Step {step}: X={infos[0]['x_pos']}, Action={action}, Reward={rewards[0]}")
-            if dones[0]:
-                logger.info(f"Episode ended. Reward: {total_reward}, Steps: {infos[0]['steps']}, Action Counts: {infos[0]['action_counts']}")
-                obs = play_vec_env.reset()
-                total_reward = 0
-        play_vec_env.close()
-
-def play(model_path="grok_cnn.zip", state_path="mario_state.sav", use_cuda=False):
-    global should_exit
-    should_exit = False
-
-    try:
-        base_env = MarioEnv('SuperMarioLand.gb', render=True)
-        base_env = FrameStack(base_env, num_stack=4)
-        env = Monitor(base_env)
-        env = DummyVecEnv([lambda: env])
-        
-        device = 'cuda' if use_cuda and torch.cuda.is_available() else 'cpu'
-        logger.info(f"Using device: {device}")
-        if use_cuda and not torch.cuda.is_available():
-            logger.warning("CUDA requested but not available")
-        
-        logger.info(f"Loading model from {model_path}")
-        model = PPO.load(model_path, env=env, device=device, custom_objects={"policy_class": CNNPolicy})
-        logger.debug(f"Loaded model policy: actor_net={model.policy.actor_net}, value_net={model.policy.value_net}")
-        logger.debug(f"Post-load self.forward type: {type(model.policy.forward)}")
-        logger.info("Model loaded!")
-        
-        signal.signal(signal.SIGINT, lambda sig, frame: signal_handler(sig, frame, env, model))
-        logger.info("Signal handler registered")
-
-        obs = env.reset()
-        total_reward = 0
-        for step in range(5000):
-            if should_exit:
-                logger.info("Exiting play loop due to Ctrl+C...")
-                break
-            action, _ = model.predict(obs, deterministic=True)
-            logger.debug(f"Play action: {action}, type: {type(action)}")
-            obs, rewards, dones, infos = env.step(action)
-            total_reward += rewards[0]
-            env.render()
-            logger.debug(f"Step {step}: X={infos[0]['x_pos']}, Action={action}, Reward={rewards[0]}")
-            if dones[0]:
-                logger.info(f"Episode ended. Reward: {total_reward}, Steps: {infos[0]['steps']}, Action Counts: {infos[0]['action_counts']}")
-                obs = env.reset()
-                total_reward = 0
         env.close()
-    except TrainingInterrupt:
-        logger.info("Play interrupted by signal handler")
-    except KeyboardInterrupt:
-        logger.info("KeyboardInterrupt caught in play, cleanup handled by signal handler")
-    except Exception as e:
-        logger.error(f"Error in play: {e}")
-        raise
-    finally:
-        if 'env' in locals():
-            try:
-                env.close()
-            except Exception as e:
-                logger.error(f"Error closing environment: {e}")
         if torch.cuda.is_available():
-            try:
-                torch.cuda.empty_cache()
-            except Exception as e:
-                logger.error(f"Error clearing CUDA cache: {e}")
+            torch.cuda.empty_cache()
         gc.collect()
-        time.sleep(0.2)
+
+def play(model_path="mario_ppo.zip", use_cuda=False):
+    global logger
+    env = MarioEnv('SuperMarioLand.gb', render=True)
+    env = GrayScaleObservation(env, keep_dim=False)
+    env = ResizeObservation(env, (84, 84))
+    env = FrameStack(env, num_stack=4)
+    env = Monitor(env)
+    env = DummyVecEnv([lambda: env])
+    
+    device = 'cuda' if use_cuda and torch.cuda.is_available() else 'cpu'
+    logger.info(f"Using device: {device}")
+    
+    model = PPO.load(model_path, env=env, device=device)
+    obs = env.reset()
+    total_reward = 0
+    for step in range(5000):
+        action, _ = model.predict(obs)
+        obs, reward, done, info = env.step(action)
+        total_reward += reward[0]
+        env.render()
+        logger.debug(f"Step {step}: X={info[0]['x_pos']}, Action={action}, Reward={reward}")
+        if done:
+            logger.info(f"Episode ended. Total Reward: {total_reward}")
+            obs = env.reset()
+            total_reward = 0
+    env.close()
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train or play Super Mario Land with RL")
-    parser.add_argument('--render', action='store_true', help="Enable game UI")
-    parser.add_argument('--play', action='store_true', help="Play trained model")
-    parser.add_argument('--resume', action='store_true', help="Resume training")
+    parser = argparse.ArgumentParser(description="Train or play Mario RL agent")
+    parser.add_argument('--model_path', type=str, default="mario_ppo.zip", help="Path to save/load model")
+    parser.add_argument('--render', action='store_true', help="Render the game during training/play")
     parser.add_argument('--debug', action='store_true', help="Enable debug logging")
-    parser.add_argument('--cuda', action='store_true', help="Use CUDA")
-    parser.add_argument('--model_path', type=str, default="grok_cnn.zip", help="Path to the model file to load")
+    parser.add_argument('--play', action='store_true', help="Play mode instead of training")
+    parser.add_argument('--cuda', action='store_true', help="Use CUDA if available")
     args = parser.parse_args()
 
-    logger = setup_logging(debug=args.debug)
+    logger = setup_logging(args.debug)
 
-    try:
-        if args.play:
-            play(model_path=args.model_path, use_cuda=args.cuda)
-        else:
-            train_rl_agent(render=args.render, resume=args.resume, use_cuda=args.cuda, model_path=args.model_path)
-    except TrainingInterrupt:
-        logger.info("Main interrupted by signal handler")
-    except KeyboardInterrupt:
-        logger.info("Interrupted in main! Cleanup handled by signal handler")
-        sys.exit(0)
-    except Exception as e:
-        logger.error(f"Error in main: {e}")
-        sys.exit(1)
+    if args.play:
+        play(model_path=args.model_path, use_cuda=args.cuda)
+    else:
+        train(render=args.render, model_path=args.model_path, use_cuda=args.cuda)
