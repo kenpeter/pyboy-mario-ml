@@ -43,8 +43,12 @@ def jump(pyboy): pyboy.send_input(WindowEvent.PRESS_BUTTON_A)
 def stop_jumping(pyboy): pyboy.send_input(WindowEvent.RELEASE_BUTTON_A)
 def press_start(pyboy):
     pyboy.send_input(WindowEvent.PRESS_BUTTON_START)
-    for _ in range(30): pyboy.tick()
+    for _ in range(30):
+        if should_exit: return  # Early exit on interrupt
+        pyboy.tick()
     pyboy.send_input(WindowEvent.RELEASE_BUTTON_START)
+
+should_exit = False
 
 class MarioEnv(gym.Env):
     def __init__(self, rom_path, render=False):
@@ -58,9 +62,10 @@ class MarioEnv(gym.Env):
         self.closed = False
         
         press_start(self.pyboy)
-        for i in range(300):
+        for i in range(100):  # Reduced from 300
+            if should_exit: break
             self.pyboy.tick()
-            if i == 150: press_start(self.pyboy)
+            if i == 50: press_start(self.pyboy)
             if get_lives(self.pyboy) > 0: break
         self.initial_lives = get_lives(self.pyboy)
 
@@ -74,13 +79,15 @@ class MarioEnv(gym.Env):
         self.epsilon = 1.0
 
     def reset(self, seed=None, options=None):
+        global should_exit
         if not self.closed:
             self.pyboy.stop(save=False)
         self.pyboy = PyBoy(self.rom_path, window="SDL2" if self.render_enabled else "null", sound=False)
         press_start(self.pyboy)
-        for i in range(300):
+        for i in range(100):  # Reduced from 300
+            if should_exit: break
             self.pyboy.tick()
-            if i == 150: press_start(self.pyboy)
+            if i == 50: press_start(self.pyboy)
             if get_lives(self.pyboy) > 0: break
         
         self.prev_x = get_mario_position(self.pyboy)[0]
@@ -90,7 +97,7 @@ class MarioEnv(gym.Env):
         self.total_reward = 0.0
         self.stall_counter = 0
         self.jump_frames = 0
-        self.epsilon = max(0.1, self.epsilon - 0.000009)  # Slower decay over 100k steps
+        self.epsilon = max(0.1, self.epsilon - 0.000003)  # Decay over ~300k steps
         return self._get_observation(), {"steps": self.steps}
 
     def step(self, action):
@@ -101,14 +108,14 @@ class MarioEnv(gym.Env):
         if np.random.random() < self.epsilon:
             action = np.random.randint(3)
             logger.debug(f"Epsilon-greedy: Forced action={action}")
-        elif 90 <= current_x <= 100:  # Goomba zone
-            action = 2  # Force right+jump near Goombas
-            self.jump_frames = 20
+        elif 80 <= current_x <= 100:  # Earlier Goomba zone
+            action = 2
+            self.jump_frames = 30  # Longer jump
             logger.debug(f"Goomba zone ({current_x}): Forced action=2")
 
         if self.stall_counter > 3:
             action = 2
-            self.jump_frames = 20
+            self.jump_frames = 30
             logger.debug("Stall detected, forcing action=2")
 
         reward = 0
@@ -117,21 +124,23 @@ class MarioEnv(gym.Env):
                 move_right(self.pyboy)
                 self.pyboy.tick()
             elif action == 1:
-                if frame == 0: self.jump_frames = 20
+                if frame == 0: self.jump_frames = 30
                 if self.jump_frames > 0:
                     jump(self.pyboy)
                     self.jump_frames -= 1
                 self.pyboy.tick()
             elif action == 2:
                 move_right(self.pyboy)
-                if frame == 0: self.jump_frames = 20
+                if frame == 0: self.jump_frames = 30
                 if self.jump_frames > 0:
                     jump(self.pyboy)
                     self.jump_frames -= 1
                 self.pyboy.tick()
             mario_x, mario_y = get_mario_position(self.pyboy)
             reward += self._get_reward(action, mario_x, mario_y)
-            if self._is_done(): break
+            if self._is_done():
+                logger.debug(f"Death detected at X={mario_x}")
+                break
         
         if self.jump_frames == 0: stop_jumping(self.pyboy)
         stop_moving(self.pyboy)
@@ -153,21 +162,72 @@ class MarioEnv(gym.Env):
         screen = np.array(self.pyboy.screen.ndarray)[..., :3]
         return screen
 
-    def _get_reward(self, action, mario_x, mario_y):
-        progress_reward = 10.0 if mario_x > self.prev_x else 0
-        jump_reward = 100.0 if action == 2 and mario_y < self.prev_y else 0  # Boosted jump reward
-        death_penalty = -100.0 if get_lives(self.pyboy) < self.prev_lives else 0
-        goomba_bonus = 50.0 if action == 2 and 90 <= mario_x <= 100 else 0  # Bonus for jumping in Goomba zone
+    # def _get_reward(self, action, mario_x, mario_y):
+    #     progress_reward = 10.0 if mario_x > self.prev_x else 0
+    #     jump_reward = 500.0 if action in [1, 2] else 0  # Reward any jump
+    #     death_penalty = -200.0 if get_lives(self.pyboy) < self.prev_lives else 0  # Harsher penalty
+    #     goomba_bonus = 100.0 if action == 2 and 80 <= mario_x <= 100 else 0  # Bonus in Goomba zone
         
+    #     if mario_x == self.prev_x:
+    #         self.stall_counter += 1
+    #     else:
+    #         self.stall_counter = 0
+    #     stall_penalty = -20.0 if self.stall_counter > 3 else 0
+        
+    #     total_reward = progress_reward + jump_reward + death_penalty + stall_penalty + goomba_bonus
+    #     logger.debug(f"Reward: progress={progress_reward}, jump={jump_reward}, death={death_penalty}, stall={stall_penalty}, goomba={goomba_bonus}, total={total_reward}")
+    #     return total_reward
+
+    def _get_reward(self, action, mario_x, mario_y):
+        # Basic rewards
+        progress_reward = 10.0 if mario_x > self.prev_x else 0
+        death_penalty = -200.0 if get_lives(self.pyboy) < self.prev_lives else 0
+        
+        # Jump-related rewards
+        jump_reward = 0
+        if action in [1, 2]:  # Any jump action
+            jump_reward = 50.0  # Base reward for jumping
+            if 80 <= mario_x <= 100:  # Goomba zone
+                jump_reward += 200.0  # Extra reward for jumping in danger zone
+        
+        # Enemy detection and avoidance
+        enemy_penalty = 0
+        enemy_bonus = 0
+        
+        # Check if Mario is in a position where enemies typically appear
+        if 80 <= mario_x <= 100:
+            # If Mario is moving right into danger without jumping
+            if action == 0 and mario_x > self.prev_x:
+                enemy_penalty = -100.0
+            # If Mario successfully jumps over an enemy (y position changes)
+            if action in [1, 2] and mario_y != self.prev_y:
+                enemy_bonus = 300.0
+        
+        # Stalling penalty (same as before)
         if mario_x == self.prev_x:
             self.stall_counter += 1
         else:
             self.stall_counter = 0
         stall_penalty = -20.0 if self.stall_counter > 3 else 0
         
-        total_reward = progress_reward + jump_reward + death_penalty + stall_penalty + goomba_bonus
-        logger.debug(f"Reward: progress={progress_reward}, jump={jump_reward}, death={death_penalty}, stall={stall_penalty}, goomba={goomba_bonus}, total={total_reward}")
+        # Combine all rewards
+        total_reward = (
+            progress_reward + 
+            jump_reward + 
+            death_penalty + 
+            stall_penalty + 
+            enemy_bonus + 
+            enemy_penalty
+        )
+        
+        logger.debug(
+            f"Reward breakdown - Progress: {progress_reward}, "
+            f"Jump: {jump_reward}, Death: {death_penalty}, "
+            f"Stall: {stall_penalty}, Enemy Bonus: {enemy_bonus}, "
+            f"Enemy Penalty: {enemy_penalty}, Total: {total_reward}"
+        )
         return total_reward
+
 
     def _is_done(self):
         return get_lives(self.pyboy) == 0
@@ -213,9 +273,7 @@ class CNNExtractor(BaseFeaturesExtractor):
         x = x.float() / 255.0
         return self.fc(self.cnn(x))
 
-should_exit = False
-
-def signal_handler(sig, frame, env, model, model_path):
+def signal_handler(sig, frame, env=None, model=None, model_path="mario_ppo.zip"):
     global should_exit
     if should_exit:
         logger.debug("Signal handler called again, ignoring...")
@@ -253,7 +311,7 @@ def train(render=False, model_path="mario_ppo.zip", use_cuda=False, resume=False
     device = 'cuda' if use_cuda and torch.cuda.is_available() else 'cpu'
     logger.info(f"Using device: {device}")
     
-    total_timesteps = 1_000_000
+    total_timesteps = 900_000
     completed_timesteps = 0
 
     if resume and os.path.exists(model_path):
@@ -271,7 +329,7 @@ def train(render=False, model_path="mario_ppo.zip", use_cuda=False, resume=False
             n_steps=2048,
             batch_size=256,
             n_epochs=5,
-            ent_coef=0.2,  # Increased for more exploration
+            ent_coef=0.2,  # More exploration
             device=device
         )
         logger.info("Starting fresh training")
@@ -329,6 +387,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     logger = setup_logging(args.debug)
+    signal.signal(signal.SIGINT, lambda sig, frame: signal_handler(sig, frame))  # Early signal handler
 
     if args.play:
         play(model_path=args.model_path, use_cuda=args.cuda)
